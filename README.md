@@ -1,117 +1,215 @@
-# HSI Super-Resolution 项目模板
+# RAPD-Net：HSI–MSI Fusion / Hyperspectral Super-Resolution
 
-高光谱图像超分辨率（HSI-MSI Fusion）项目的通用代码模板。
+本仓库提供 RAPD-Net 的数据读取、SRF 构建、训练辅助函数和分阶段模型实现。
 
-提供可直接复用的 dataloader、损失函数、评估指标、SRF 工具和通用训练辅助函数，
-不依赖任何具体的模型结构。
+当前主线已由“端元—丰度”改为：
 
-## 模板内容
+```text
+LR-HSI 场景自适应光谱基提取
+        ↓
+频率可靠性感知的光谱系数残差注入
+        ↓
+双域不确定性感知的基内—正交补残差扩散精修
+        ↓
+物理闭环与不确定度校准联合微调
+```
+
+## 主要文件
 
 | 文件 | 说明 |
 |------|------|
-| `data_loader.py` | HSI 数据读取（.mat / h5）、预处理、patch 构建、DataLoader |
-| `losses.py` | 光谱重建损失：SAM、光谱梯度、数据一致性、VQ commitment 等 |
-| `metrics.py` | PSNR / RMSE / SAM / ERGAS / SSIM / CC 评估指标 |
-| `srf_utils.py` | 光谱响应函数（SRF）加载、插值、权重构建、HSI→MSI 转换 |
-| `prepare_srf_weights.py` | 预计算并保存 SRF 权重矩阵 |
-| `utils.py` | 通用工具：随机种子、设备选择、checkpoint 存取、日志、CSV logger |
-| `config.py` | 训练配置 dataclass + 命令行解析（不含模型参数） |
-| `main.py` | 模板入口示例，展示如何串联各组件 |
-| `models/stage1_unmixing.py` | RAPD-Net 第一阶段端元字典与丰度估计模型 |
-| `train_stage1_unmix.py` | 第一阶段训练、验证、检查点及端元/丰度导出 |
-| `analyze_spectral_regions.py` | 按光谱区域分析模型重建质量（模型通过参数传入） |
-| `visualize_base_reconstruction.py` | 重建结果可视化：RGB 对比图、光谱曲线、误差图 |
+| `data_loader.py` | HSI 数据读取、归一化、训练/测试区域划分、LR-HSI 与 HR-MSI 构建 |
+| `srf_utils.py` | WorldView-2 SRF 加载、插值和 HSI→MSI 投影 |
+| `metrics.py` | PSNR / RMSE / SAM / ERGAS / SSIM / CC |
+| `losses.py` | SAM 等基础损失 |
+| `models/stage1_spectral_basis.py` | 新阶段一：仿射正交光谱基提取模型 |
+| `train_stage1_basis.py` | 新阶段一完整训练、验证、检查点和导出 |
+| `inspect_stage1_basis.py` | 新阶段一正交性、残差泄漏、系数使用和可视化检查 |
+| `models/stage2_frequency_reliability.py` | SFSR 风格 Shared Encoder + SSP + NSP 频率可靠性模块 |
+| `models/stage1_unmixing.py` | 旧端元—丰度阶段一，仅保留用于历史实验复现 |
+| `train_stage1_unmix.py` | 旧阶段一训练脚本，仅保留用于历史实验复现 |
+| `models/stage2_physical_fusion.py` | 旧丰度/非负锥阶段二，等待新系数框架替换，不作为当前主线使用 |
 
-## 使用方式
+# 新阶段一：场景自适应光谱基提取
 
-1. 将本项目复制为新项目的起点。
-2. 在 `config.py` 的 `get_dataset_configs()` 中注册你的数据集。
-3. 实现你自己的模型（例如 `models/your_model.py`）。
-4. 在 `main.py`（或你自己的入口脚本）中串联 dataloader、模型、损失和训练循环。
+阶段一只使用 LR-HSI，不读取 HR-MSI，也不使用 HR-HSI 监督。
 
-```python
-# 最小示例
-from config import parse_args
-from data_loader import build_loaders
-from losses import SAMLoss, DataConsistencyLoss
-from utils import set_seed, get_device
+模型采用仿射正交子空间：
 
-cfg = parse_args()
-set_seed(cfg.seed)
-train_loader, test_loader, info = build_loaders(cfg)
+\[
+C_{\mathrm{lr}}=U_r^\top(Y_{\mathrm{lr}}-\mu),
+\]
 
-# model = YourModel(...)
-# criterion = ...
-# train loop ...
-```
+\[
+\widehat Y_{\mathrm{lr}}=\mu+U_rC_{\mathrm{lr}},
+\]
 
-## RAPD-Net 第一阶段：物理解混
+其中：
 
-第一阶段只使用 LR-HSI，学习场景级端元字典和低分辨率丰度图。端元先从真实 LR-HSI 像素中通过光谱最远点采样初始化，再与丰度估计器联合训练。
+- \(\mu\) 为训练 LR-HSI 估计得到的场景均值光谱；
+- \(U_r\in\mathbb R^{B\times r}\) 为场景自适应正交光谱基；
+- \(U_r^\top U_r=I\) 由前向 QR 正交化严格保证；
+- \(C_{\mathrm{lr}}\) 为允许正负值的低分辨率光谱系数；
+- 光谱基是数学坐标，不应按真实端元曲线解释。
+
+## PCA 初始化
+
+训练开始前，从训练 LR-HSI 中采样光谱，计算场景均值、协方差矩阵和前 \(r\) 个 PCA 方向。PCA 初始化检查点会在优化前单独保存，避免后续 L1/SAM 微调反而损害最优子空间。
+
+## 训练命令
+
+建议先运行两轮 smoke test：
 
 ```bash
-python train_stage1_unmix.py \
+python train_stage1_basis.py \
   --dataset PaviaU \
-  --epochs 300 \
+  --basis_rank 32 \
+  --basis_init_pixels 100000 \
+  --epochs 2 \
   --batch_size 4 \
-  --lr 1e-4 \
-  --unmix_num_endmembers 32
+  --lr 5e-5
 ```
 
-常用阶段参数：
+正式训练：
 
-- `--unmix_num_endmembers`：端元/光谱原子数，默认 32；
-- `--unmix_hidden_channels`：丰度估计器宽度，默认 64；
-- `--unmix_num_blocks`：空间残差块数量，默认 3；
-- `--unmix_init_pixels`：端元初始化最多使用的 LR-HSI 像素数；
-- `--unmix_lambda_sam`：训练阶段 SAM 权重，默认 0.5；
-- `--unmix_lambda_sgrad`：训练阶段一阶光谱梯度权重，默认 0.1；
-- `--unmix_selection_sam_weight`：默认最佳检查点选择中的 SAM 权重，默认 1.0；
-- `--unmix_selection_sgrad_weight`：默认最佳检查点选择中的光谱梯度权重，默认 0.2；
-- `--lambda_endmember_div`：近重复端元惩罚权重；
-- `--lambda_abundance_tv`：丰度空间 TV 权重；
-- `--lambda_abundance_entropy`：丰度低熵约束权重。
+```bash
+python train_stage1_basis.py \
+  --dataset PaviaU \
+  --basis_rank 32 \
+  --basis_init_pixels 100000 \
+  --epochs 300 \
+  --batch_size 4 \
+  --lr 5e-5
+```
 
-训练阶段的 SAM 权重与检查点选择权重彼此独立。默认训练保持 L1 与光谱角之间的平衡，而检查点选择更偏向光谱保真，避免仅因 L1 较低而错过 SAM 更好的模型。
+默认训练目标包括：
 
-输出位置：
+\[
+L_{\mathrm{basis}}
+=
+L_1
++0.5L_{\mathrm{SAM}}
++0.1L_{\nabla\lambda}
++0.05L_{\nabla^2\lambda}
++0.001L_{\mathrm{projector-anchor}}.
+\]
+
+投影锚定约束比较的是：
+
+\[
+U_rU_r^\top
+\]
+
+而不是逐列约束基向量，避免受到基旋转和符号不唯一性的影响。
+
+## 阶段一输出
+
+检查点：
+
+```text
+checkpoints/stage1_basis/<dataset>/
+├── basis_pca_init.pth
+├── basis_best.pth
+├── basis_best_sam.pth
+├── basis_best_psnr.pth
+├── basis_last.pth
+└── basis_for_stage2.pth
+```
+
+其中：
+
+- `basis_pca_init.pth`：未经梯度优化的 PCA 初始化；
+- `basis_best.pth`：按 L1、SAM 和光谱形态综合分数选择；
+- `basis_best_sam.pth`：验证 SAM 最低；
+- `basis_best_psnr.pth`：验证 PSNR 最高；
+- `basis_for_stage2.pth`：重新统计最终系数尺度后的阶段二部署检查点，后续阶段优先使用。
+
+导出文件：
+
+```text
+outputs/stage1_basis/<dataset>/
+├── spectral_basis.npy
+├── mean_spectrum.npy
+├── coefficient_scale.npy
+├── coefficient_mean.npy
+├── basis_projector.npy
+├── pca_eigenvalues.npy
+├── stage1_basis_test_outputs.npz
+├── basis_statistics.json
+└── final_metrics.json
+```
+
+阶段二必须使用同一个检查点中的：
+
+\[
+\mu,\quad U_r,\quad C_{\mathrm{lr}}.
+\]
+
+不得对导出的基向量重新排序，也不能仅根据曲线外观删除某一基维度。
+
+## 阶段一检查
+
+检查部署检查点：
+
+```bash
+python inspect_stage1_basis.py \
+  --dataset PaviaU
+```
+
+比较全部检查点：
+
+```bash
+python inspect_stage1_basis.py \
+  --dataset PaviaU \
+  --compare_all
+```
+
+检查结果位于：
+
+```text
+outputs/stage1_basis_inspection/<dataset>/
+```
+
+重点关注：
+
+- `orthogonality_error`：应接近数值精度；
+- `projector_idempotence_error`：应接近数值精度；
+- `residual_basis_leakage_ratio`：投影残差重新落入基空间的比例，应接近 0；
+- `PSNR / SAM`：比较 PCA 初始化和微调检查点；
+- `coefficient_energy_share`：检查是否存在几乎无能量的坐标；
+- `per_band_rmse.png`：检查难重建波段是否集中在特定光谱区域。
+
+# 当前阶段兼容性
+
+新的 `basis_for_stage2.pth` 与旧的：
 
 ```text
 checkpoints/stage1_unmix/<dataset>/unmixing_best.pth
-checkpoints/stage1_unmix/<dataset>/unmixing_best_sam.pth
-checkpoints/stage1_unmix/<dataset>/unmixing_best_l1.pth
-checkpoints/stage1_unmix/<dataset>/unmixing_last.pth
-outputs/stage1_unmix/<dataset>/endmembers_model_order.npy
-outputs/stage1_unmix/<dataset>/endmembers_sorted.npy
-outputs/stage1_unmix/<dataset>/stage1_test_outputs.npz
-logs/stage1_unmix/<dataset>.csv
 ```
 
-- `unmixing_best.pth`：按光谱优先综合分数选择，作为后续阶段默认检查点；
-- `unmixing_best_sam.pth`：验证集 SAM 最低的检查点；
-- `unmixing_best_l1.pth`：验证集 L1 最低的检查点；
-- `endmembers_sorted.npy`：仅用于曲线查看和人工检查，不用于替换模型内部端元顺序。
+结构完全不同。
 
-后续阶段应优先比较 `unmixing_best.pth` 与 `unmixing_best_sam.pth`，确认后续丰度注入是否更受益于综合重建精度还是最低光谱角。
+旧 `train_stage2_physical.py` 仍依赖 `Stage1UnmixingNet`，不能加载新阶段一检查点。新的阶段二将改为：
 
-## 目录结构约定
+\[
+X_2
+=
+\mu+U_r(C_{\mathrm{up}}+\Delta C_{\mathrm{rel}}),
+\]
 
-```
+其中 \(\Delta C_{\mathrm{rel}}\) 是由 SSP/NSP 可靠 MSI 细节引导的有符号光谱系数残差。
+
+# 数据目录
+
+```text
 project/
-├── data/               # 数据和 SRF 权重
-│   ├── raw/            # 原始 HSI .mat 文件
-│   ├── wavelengths/    # 各数据集波长文件
-│   ├── srf/            # 原始 SRF CSV
-│   └── srf_weights/    # 预计算的 SRF 权重
-├── checkpoints/        # 模型权重
-├── logs/               # 训练日志
-├── outputs/            # 预测结果、指标、可视化
-├── models/             # 用户自己的模型定义
-└── code_template/      # 本模板（可作为 git submodule）
+├── data/
+│   ├── raw/
+│   ├── wavelengths/
+│   ├── srf/
+│   └── srf_weights/
+├── checkpoints/
+├── logs/
+├── outputs/
+└── models/
 ```
-
-## 扩展原则
-
-- 本模板只包含**与模型结构无关**的通用组件。
-- 具体模型实现、训练逻辑、对比实验等请放在模板外的独立模块中。
-- 对比模型建议统一放入 `models/baselines/`，配置统一放入 `configs/baselines/`。
