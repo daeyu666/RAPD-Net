@@ -17,6 +17,8 @@
 | `utils.py` | 通用工具：随机种子、设备选择、checkpoint 存取、日志、CSV logger |
 | `config.py` | 训练配置 dataclass + 命令行解析（不含模型参数） |
 | `main.py` | 模板入口示例，展示如何串联各组件 |
+| `models/stage1_unmixing.py` | RAPD-Net 第一阶段端元字典与丰度估计模型 |
+| `train_stage1_unmix.py` | 第一阶段训练、验证、检查点及端元/丰度导出 |
 | `analyze_spectral_regions.py` | 按光谱区域分析模型重建质量（模型通过参数传入） |
 | `visualize_base_reconstruction.py` | 重建结果可视化：RGB 对比图、光谱曲线、误差图 |
 
@@ -42,6 +44,41 @@ train_loader, test_loader, info = build_loaders(cfg)
 # criterion = ...
 # train loop ...
 ```
+
+## RAPD-Net 第一阶段：物理解混
+
+第一阶段只使用 LR-HSI，学习场景级端元字典和低分辨率丰度图。端元先从真实 LR-HSI 像素中通过光谱最远点采样初始化，再与丰度估计器联合训练。
+
+```bash
+python train_stage1_unmix.py \
+  --dataset PaviaU \
+  --epochs 300 \
+  --batch_size 4 \
+  --lr 1e-4 \
+  --unmix_num_endmembers 32
+```
+
+常用阶段参数：
+
+- `--unmix_num_endmembers`：端元/光谱原子数，默认 32；
+- `--unmix_hidden_channels`：丰度估计器宽度，默认 64；
+- `--unmix_num_blocks`：空间残差块数量，默认 3；
+- `--unmix_init_pixels`：端元初始化最多使用的 LR-HSI 像素数；
+- `--lambda_endmember_div`：近重复端元惩罚权重；
+- `--lambda_abundance_tv`：丰度空间 TV 权重；
+- `--lambda_abundance_entropy`：丰度低熵约束权重。
+
+输出位置：
+
+```text
+checkpoints/stage1_unmix/<dataset>/unmixing_best.pth
+outputs/stage1_unmix/<dataset>/endmembers_model_order.npy
+outputs/stage1_unmix/<dataset>/endmembers_sorted.npy
+outputs/stage1_unmix/<dataset>/stage1_test_outputs.npz
+logs/stage1_unmix/<dataset>.csv
+```
+
+后续阶段应从 `unmixing_best.pth` 加载并冻结端元字典；`endmembers_sorted.npy` 只用于曲线查看和人工检查，不用于替换模型内部端元顺序。
 
 ## 目录结构约定
 
