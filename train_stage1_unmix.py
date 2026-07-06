@@ -1,7 +1,10 @@
 """Train Stage 1 of RAPD-Net: physical unmixing on LR-HSI only.
 
-This stage learns a scene-level endmember bank and LR abundance estimator.
-The best checkpoint is later frozen by the reliable abundance-injection stage.
+This stage learns a scene-level endmember bank and an LR abundance estimator.
+Training and checkpoint selection use separate spectral weights: training keeps
+L1/SAM optimization balanced, while the default best checkpoint is selected by
+a stronger spectral-first score. Independent best-SAM and best-L1 checkpoints
+are also retained for diagnosis and later-stage comparison.
 """
 
 from __future__ import annotations
@@ -87,8 +90,8 @@ def compute_losses(
     }
     losses["total"] = (
         cfg.lambda_l1 * losses["l1"]
-        + cfg.lambda_sam * losses["sam"]
-        + cfg.lambda_sgrad * losses["sgrad"]
+        + cfg.unmix_lambda_sam * losses["sam"]
+        + cfg.unmix_lambda_sgrad * losses["sgrad"]
         + cfg.lambda_endmember_div * losses["div"]
         + cfg.lambda_abundance_tv * losses["tv"]
         + cfg.lambda_abundance_entropy * losses["entropy"]
@@ -218,8 +221,8 @@ def evaluate(
     result["sam_deg"] = result["sam"] * 180.0 / math.pi
     result["selection"] = (
         cfg.lambda_l1 * result["l1"]
-        + cfg.lambda_sam * result["sam"]
-        + cfg.lambda_sgrad * result["sgrad"]
+        + cfg.unmix_selection_sam_weight * result["sam"]
+        + cfg.unmix_selection_sgrad_weight * result["sgrad"]
     )
     return result
 
@@ -321,6 +324,19 @@ def parse_stage1_args():
     parser.add_argument("--unmix_init_pixels", type=int, default=50000)
     parser.add_argument("--unmix_diversity_margin", type=float, default=0.98)
     parser.add_argument("--unmix_grad_clip", type=float, default=1.0)
+
+    # Stage-1 training uses stronger spectral supervision than the generic
+    # project defaults. SAM is measured in radians; 0.5 gives it comparable or
+    # greater influence than L1 at the observed PaviaU loss scale.
+    parser.add_argument("--unmix_lambda_sam", type=float, default=0.5)
+    parser.add_argument("--unmix_lambda_sgrad", type=float, default=0.1)
+
+    # Checkpoint selection is deliberately more spectral-first than training.
+    # With weight 1.0, a meaningful SAM reduction can outweigh a moderate L1
+    # increase, while L1 remains present to reject scale-distorted solutions.
+    parser.add_argument("--unmix_selection_sam_weight", type=float, default=1.0)
+    parser.add_argument("--unmix_selection_sgrad_weight", type=float, default=0.2)
+
     parser.add_argument("--lambda_endmember_div", type=float, default=0.01)
     parser.add_argument("--lambda_abundance_tv", type=float, default=0.001)
     parser.add_argument("--lambda_abundance_entropy", type=float, default=0.001)
@@ -365,6 +381,8 @@ def main() -> None:
     ensure_dir(log_dir)
 
     best_path = os.path.join(checkpoint_dir, "unmixing_best.pth")
+    best_sam_path = os.path.join(checkpoint_dir, "unmixing_best_sam.pth")
+    best_l1_path = os.path.join(checkpoint_dir, "unmixing_best_l1.pth")
     last_path = os.path.join(checkpoint_dir, "unmixing_last.pth")
     text_log_path = os.path.join(log_dir, f"{cfg.dataset}.log")
     csv_logger = CSVLogger(
@@ -386,6 +404,8 @@ def main() -> None:
 
     start_epoch = 0
     best_selection = float("inf")
+    best_sam = float("inf")
+    best_l1 = float("inf")
     if cfg.resume:
         start_epoch, best_selection = load_checkpoint(
             model,
@@ -413,7 +433,11 @@ def main() -> None:
     write_log(
         text_log_path,
         f"Stage-1 parameters: {count_parameters(model):.3f} M; "
-        f"bands={info['n_bands']}; K={cfg.unmix_num_endmembers}.",
+        f"bands={info['n_bands']}; K={cfg.unmix_num_endmembers}; "
+        f"train weights: L1={cfg.lambda_l1}, SAM={cfg.unmix_lambda_sam}, "
+        f"SGrad={cfg.unmix_lambda_sgrad}; selection weights: "
+        f"L1={cfg.lambda_l1}, SAM={cfg.unmix_selection_sam_weight}, "
+        f"SGrad={cfg.unmix_selection_sgrad_weight}.",
     )
 
     for epoch in range(start_epoch, cfg.epochs):
@@ -431,7 +455,7 @@ def main() -> None:
             f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | "
             f"train L1={train_result['l1']:.6f}, SAM={train_sam_deg:.4f} deg | "
             f"val L1={val_result['l1']:.6f}, SAM={val_result['sam_deg']:.4f} deg | "
-            f"selection={val_result['selection']:.6f}",
+            f"spectral selection={val_result['selection']:.6f}",
         )
         csv_logger.write(
             {
@@ -455,7 +479,15 @@ def main() -> None:
             "num_endmembers": cfg.unmix_num_endmembers,
             "hidden_channels": cfg.unmix_hidden_channels,
             "num_blocks": cfg.unmix_num_blocks,
+            "train_sam_weight": cfg.unmix_lambda_sam,
+            "train_sgrad_weight": cfg.unmix_lambda_sgrad,
+            "selection_sam_weight": cfg.unmix_selection_sam_weight,
+            "selection_sgrad_weight": cfg.unmix_selection_sgrad_weight,
+            "val_l1": val_result["l1"],
+            "val_sam_deg": val_result["sam_deg"],
+            "val_sgrad": val_result["sgrad"],
         }
+
         if val_result["selection"] < best_selection:
             best_selection = val_result["selection"]
             save_checkpoint(
@@ -466,7 +498,39 @@ def main() -> None:
                 best_path,
                 extra=checkpoint_extra,
             )
-            write_log(text_log_path, f"Saved new best checkpoint: {best_path}")
+            write_log(text_log_path, f"Saved spectral-first checkpoint: {best_path}")
+
+        if val_result["sam"] < best_sam:
+            best_sam = val_result["sam"]
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch + 1,
+                best_sam,
+                best_sam_path,
+                extra=checkpoint_extra,
+            )
+            write_log(
+                text_log_path,
+                f"Saved lowest-SAM checkpoint: {best_sam_path} "
+                f"({val_result['sam_deg']:.4f} deg)",
+            )
+
+        if val_result["l1"] < best_l1:
+            best_l1 = val_result["l1"]
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch + 1,
+                best_l1,
+                best_l1_path,
+                extra=checkpoint_extra,
+            )
+            write_log(
+                text_log_path,
+                f"Saved lowest-L1 checkpoint: {best_l1_path} "
+                f"({val_result['l1']:.6f})",
+            )
 
         save_checkpoint(
             model,
@@ -485,7 +549,11 @@ def main() -> None:
         load_optimizer=False,
     )
     export_stage1_artifacts(model, test_loader, info, output_dir, device)
-    write_log(text_log_path, f"Stage 1 complete. Artifacts: {output_dir}.")
+    write_log(
+        text_log_path,
+        f"Stage 1 complete. Default exports use the spectral-first checkpoint. "
+        f"Artifacts: {output_dir}.",
+    )
 
 
 if __name__ == "__main__":
