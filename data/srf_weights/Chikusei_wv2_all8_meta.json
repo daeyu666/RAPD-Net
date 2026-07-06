@@ -1,0 +1,26 @@
+{
+  "dataset": "Chikusei",
+  "n_bands": 128,
+  "wavelength_min_nm": 363.0,
+  "wavelength_max_nm": 1018.0,
+  "band_set": "wv2_all8",
+  "selected_bands": [
+    "WV2 Coastal Blue",
+    "WV2 Blue",
+    "WV2 Green",
+    "WV2 Yellow",
+    "WV2 Red",
+    "WV2 RedEdge",
+    "WV2 NIR1",
+    "WV2 NIR2"
+  ],
+  "weights_shape": [
+    8,
+    128
+  ],
+  "weights_npy": "./data/srf_weights/Chikusei_wv2_all8_weights.npy",
+  "weights_csv": "./data/srf_weights/Chikusei_wv2_all8_weights.csv",
+  "summary_csv": "./data/srf_weights/Chikusei_wv2_all8_summary.csv",
+  "normalize": true,
+  "interp": "pchip"
+}

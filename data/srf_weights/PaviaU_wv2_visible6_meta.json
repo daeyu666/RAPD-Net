@@ -1,0 +1,24 @@
+{
+  "dataset": "PaviaU",
+  "n_bands": 103,
+  "wavelength_min_nm": 430.0,
+  "wavelength_max_nm": 838.0,
+  "band_set": "wv2_visible6",
+  "selected_bands": [
+    "WV2 Coastal Blue",
+    "WV2 Blue",
+    "WV2 Green",
+    "WV2 Yellow",
+    "WV2 Red",
+    "WV2 RedEdge"
+  ],
+  "weights_shape": [
+    6,
+    103
+  ],
+  "weights_npy": "./data/srf_weights/PaviaU_wv2_visible6_weights.npy",
+  "weights_csv": "./data/srf_weights/PaviaU_wv2_visible6_weights.csv",
+  "summary_csv": "./data/srf_weights/PaviaU_wv2_visible6_summary.csv",
+  "normalize": true,
+  "interp": "pchip"
+}
