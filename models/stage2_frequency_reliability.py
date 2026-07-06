@@ -8,13 +8,20 @@ it with a generic frequency attention block:
 2. a Spectral Splitter (SSP) performs channel-wise 2-D Fourier decomposition
    with two learnable spectral boundaries per feature channel;
 3. a Noise Splitter (NSP) aggregates LF and MF features, extracts Sobel edges,
-   and isolates unsupported HF responses with the original binary edge mask;
+   and isolates unsupported HF responses with a binary edge-support mask;
 4. the original LF alignment and noise-minimization losses are exposed for the
    Stage-2 objective.
 
+The original fixed NSP threshold is retained as an exact-reproduction option.
+For RAPD-Net, the default is a robust relative threshold because Sobel response
+magnitudes are computed on learned features whose scale can drift during
+training. This keeps the original LM -> Sobel -> threshold -> HF split intact,
+while preventing an absolute value such as 1e-5 from turning every location
+into reliable high frequency on nearly noise-free simulated MSI.
+
 No abundance correction is implemented in this file. The outputs preserve the
 raw LF/MF/HF branches so the subsequent abundance-residual module can consume
-them without hiding the original SSP/NSP structure behind a simplified gate.
+them without hiding the SSP/NSP structure behind a simplified gate.
 """
 
 from __future__ import annotations
@@ -233,18 +240,57 @@ class ChannelWiseSpectralSplitter(nn.Module):
 
 
 class NoiseSplitter(nn.Module):
-    """SFSR-style Noise Splitter using LM-supported Sobel evidence."""
+    """SFSR-style Noise Splitter using LM-supported Sobel evidence.
+
+    Threshold modes:
+        ``fixed``:
+            Exact paper-style absolute threshold. Use ``edge_mask_threshold=1e-5``
+            for the original setting. It is retained for reproduction/ablation,
+            but it can collapse on learned features with a different scale.
+
+        ``relative`` (default):
+            Normalize each sample's edge map by a detached robust high quantile,
+            then apply a fixed relative threshold. This is scale-adaptive and
+            does not force a predetermined percentage of pixels to be noise.
+
+        ``quantile``:
+            Use a detached per-sample edge quantile as the threshold. This keeps
+            approximately ``noise_quantile`` of pixels in the noise mask and is
+            provided as an explicit ablation, not the default behavior.
+    """
+
+    VALID_THRESHOLD_MODES = {"fixed", "relative", "quantile"}
 
     def __init__(
         self,
         channels: int,
-        edge_mask_threshold: float = 1e-5,
+        edge_threshold_mode: str = "relative",
+        edge_mask_threshold: float = 0.1,
+        edge_reference_quantile: float = 0.9,
+        noise_quantile: float = 0.2,
+        eps: float = 1e-8,
     ):
         super().__init__()
+        if edge_threshold_mode not in self.VALID_THRESHOLD_MODES:
+            raise ValueError(
+                f"edge_threshold_mode must be one of "
+                f"{sorted(self.VALID_THRESHOLD_MODES)}, got {edge_threshold_mode}"
+            )
         if edge_mask_threshold < 0:
             raise ValueError("edge_mask_threshold must be non-negative")
+        if not 0.0 < edge_reference_quantile <= 1.0:
+            raise ValueError("edge_reference_quantile must be in (0, 1]")
+        if not 0.0 < noise_quantile < 1.0:
+            raise ValueError("noise_quantile must be in (0, 1)")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
         self.channels = int(channels)
+        self.edge_threshold_mode = edge_threshold_mode
         self.edge_mask_threshold = float(edge_mask_threshold)
+        self.edge_reference_quantile = float(edge_reference_quantile)
+        self.noise_quantile = float(noise_quantile)
+        self.eps = float(eps)
 
         sobel_x = torch.tensor(
             [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
@@ -260,6 +306,59 @@ class NoiseSplitter(nn.Module):
             sobel_y.view(1, 1, 3, 3).repeat(channels, 1, 1, 1),
             persistent=False,
         )
+
+    @staticmethod
+    def _spatial_quantile(
+        edge_magnitude: torch.Tensor,
+        quantile: float,
+    ) -> torch.Tensor:
+        """Detached per-sample quantile shaped [N, 1, 1, 1]."""
+        flat = edge_magnitude.detach().flatten(start_dim=2)
+        value = torch.quantile(flat, quantile, dim=2, keepdim=True)
+        return value.unsqueeze(-1)
+
+    def _build_noise_mask(
+        self,
+        edge_magnitude: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        batch = edge_magnitude.size(0)
+
+        if self.edge_threshold_mode == "fixed":
+            edge_score = edge_magnitude
+            effective_threshold = edge_magnitude.new_full(
+                (batch, 1, 1, 1), self.edge_mask_threshold
+            )
+            noise_mask = edge_score < effective_threshold
+            reference_scale = edge_magnitude.new_ones((batch, 1, 1, 1))
+
+        elif self.edge_threshold_mode == "relative":
+            reference_scale = self._spatial_quantile(
+                edge_magnitude,
+                self.edge_reference_quantile,
+            ).clamp_min(self.eps)
+            edge_score = edge_magnitude / reference_scale
+            effective_threshold = edge_magnitude.new_full(
+                (batch, 1, 1, 1), self.edge_mask_threshold
+            )
+            noise_mask = edge_score < effective_threshold
+
+        else:  # quantile
+            reference_scale = edge_magnitude.new_ones((batch, 1, 1, 1))
+            edge_score = edge_magnitude
+            effective_threshold = self._spatial_quantile(
+                edge_magnitude,
+                self.noise_quantile,
+            )
+            # <= avoids an empty mask when a flat region has exactly zero edge.
+            noise_mask = edge_score <= effective_threshold
+
+        noise_mask = noise_mask.to(dtype=edge_magnitude.dtype)
+        return {
+            "edge_score": edge_score,
+            "effective_threshold": effective_threshold,
+            "reference_scale": reference_scale,
+            "noise_mask": noise_mask,
+        }
 
     def forward(
         self,
@@ -290,25 +389,47 @@ class NoiseSplitter(nn.Module):
         edge_magnitude_channel = torch.sqrt(
             grad_x.square() + grad_y.square() + 1e-12
         )
-        # The paper uses one fixed tau_mask and visualizes one spatial mask.
-        # Channel evidence is therefore aggregated before the binary decision.
+        # The paper visualizes one spatial support mask. Channel evidence is
+        # aggregated before the binary decision rather than producing an
+        # independent mask per feature channel.
         edge_magnitude = edge_magnitude_channel.mean(dim=1, keepdim=True)
 
-        # Original NSP definition: M = Ind(E < tau_mask).
-        noise_mask = (edge_magnitude < self.edge_mask_threshold).to(low_mid.dtype)
+        threshold = self._build_noise_mask(edge_magnitude)
+        noise_mask = threshold["noise_mask"]
         reliability_map = 1.0 - noise_mask
         noise_feature = high * noise_mask
         reliable_high = high * reliability_map
+
+        noise_ratio_per_sample = noise_mask.mean(dim=(1, 2, 3))
+        reliability_ratio_per_sample = reliability_map.mean(dim=(1, 2, 3))
+        edge_flat = edge_magnitude.detach().flatten(start_dim=2)
+        edge_quantiles = torch.stack(
+            [
+                torch.quantile(edge_flat, 0.1, dim=2).squeeze(1),
+                torch.quantile(edge_flat, 0.5, dim=2).squeeze(1),
+                torch.quantile(edge_flat, 0.9, dim=2).squeeze(1),
+                torch.quantile(edge_flat, 0.99, dim=2).squeeze(1),
+            ],
+            dim=1,
+        )
 
         return {
             "low_mid": low_mid,
             "edge_magnitude_channel": edge_magnitude_channel,
             "edge_magnitude": edge_magnitude,
+            "edge_score": threshold["edge_score"],
+            "effective_threshold": threshold["effective_threshold"],
+            "edge_reference_scale": threshold["reference_scale"],
+            "edge_quantiles": edge_quantiles,
             "noise_mask": noise_mask,
             "reliability_mask_channel": reliability_map.expand_as(high),
             "reliability_map": reliability_map,
             "noise_feature": noise_feature,
             "reliable_high": reliable_high,
+            "noise_ratio_per_sample": noise_ratio_per_sample,
+            "reliability_ratio_per_sample": reliability_ratio_per_sample,
+            "noise_ratio": noise_ratio_per_sample.mean(),
+            "reliability_ratio": reliability_ratio_per_sample.mean(),
         }
 
 
@@ -329,7 +450,10 @@ class FrequencyReliabilityScreen(nn.Module):
         init_low_boundary: float = 5.0,
         init_high_boundary: float = 18.0,
         boundary_temperature: float = 0.5,
-        edge_mask_threshold: float = 1e-5,
+        edge_threshold_mode: str = "relative",
+        edge_mask_threshold: float = 0.1,
+        edge_reference_quantile: float = 0.9,
+        noise_quantile: float = 0.2,
         hard_partition: bool = True,
     ):
         super().__init__()
@@ -351,7 +475,10 @@ class FrequencyReliabilityScreen(nn.Module):
         )
         self.noise_splitter = NoiseSplitter(
             channels=feature_channels,
+            edge_threshold_mode=edge_threshold_mode,
             edge_mask_threshold=edge_mask_threshold,
+            edge_reference_quantile=edge_reference_quantile,
+            noise_quantile=noise_quantile,
         )
 
     def spectral_boundary_parameters(self) -> Iterable[nn.Parameter]:
@@ -424,6 +551,10 @@ class FrequencyReliabilityScreen(nn.Module):
             "high_feature": split["high"],
             "low_mid_feature": noise["low_mid"],
             "edge_magnitude": noise["edge_magnitude"],
+            "edge_score": noise["edge_score"],
+            "effective_threshold": noise["effective_threshold"],
+            "edge_reference_scale": noise["edge_reference_scale"],
+            "edge_quantiles": noise["edge_quantiles"],
             "noise_mask": noise["noise_mask"],
             "reliability_mask_channel": noise["reliability_mask_channel"],
             "reliability_map": noise["reliability_map"],
@@ -431,6 +562,12 @@ class FrequencyReliabilityScreen(nn.Module):
             "reliable_high_feature": noise["reliable_high"],
             "reliable_detail_feature": reliable_detail,
             "refined_reference_feature": refined_reference,
+            "noise_ratio_per_sample": noise["noise_ratio_per_sample"],
+            "reliability_ratio_per_sample": noise[
+                "reliability_ratio_per_sample"
+            ],
+            "noise_ratio": noise["noise_ratio"],
+            "reliability_ratio": noise["reliability_ratio"],
             "tau_low": split["tau_low"],
             "tau_high": split["tau_high"],
             "low_mask": split["low_mask"],
