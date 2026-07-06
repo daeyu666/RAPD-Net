@@ -64,21 +64,35 @@ python train_stage1_unmix.py \
 - `--unmix_hidden_channels`：丰度估计器宽度，默认 64；
 - `--unmix_num_blocks`：空间残差块数量，默认 3；
 - `--unmix_init_pixels`：端元初始化最多使用的 LR-HSI 像素数；
+- `--unmix_lambda_sam`：训练阶段 SAM 权重，默认 0.5；
+- `--unmix_lambda_sgrad`：训练阶段一阶光谱梯度权重，默认 0.1；
+- `--unmix_selection_sam_weight`：默认最佳检查点选择中的 SAM 权重，默认 1.0；
+- `--unmix_selection_sgrad_weight`：默认最佳检查点选择中的光谱梯度权重，默认 0.2；
 - `--lambda_endmember_div`：近重复端元惩罚权重；
 - `--lambda_abundance_tv`：丰度空间 TV 权重；
 - `--lambda_abundance_entropy`：丰度低熵约束权重。
+
+训练阶段的 SAM 权重与检查点选择权重彼此独立。默认训练保持 L1 与光谱角之间的平衡，而检查点选择更偏向光谱保真，避免仅因 L1 较低而错过 SAM 更好的模型。
 
 输出位置：
 
 ```text
 checkpoints/stage1_unmix/<dataset>/unmixing_best.pth
+checkpoints/stage1_unmix/<dataset>/unmixing_best_sam.pth
+checkpoints/stage1_unmix/<dataset>/unmixing_best_l1.pth
+checkpoints/stage1_unmix/<dataset>/unmixing_last.pth
 outputs/stage1_unmix/<dataset>/endmembers_model_order.npy
 outputs/stage1_unmix/<dataset>/endmembers_sorted.npy
 outputs/stage1_unmix/<dataset>/stage1_test_outputs.npz
 logs/stage1_unmix/<dataset>.csv
 ```
 
-后续阶段应从 `unmixing_best.pth` 加载并冻结端元字典；`endmembers_sorted.npy` 只用于曲线查看和人工检查，不用于替换模型内部端元顺序。
+- `unmixing_best.pth`：按光谱优先综合分数选择，作为后续阶段默认检查点；
+- `unmixing_best_sam.pth`：验证集 SAM 最低的检查点；
+- `unmixing_best_l1.pth`：验证集 L1 最低的检查点；
+- `endmembers_sorted.npy`：仅用于曲线查看和人工检查，不用于替换模型内部端元顺序。
+
+后续阶段应优先比较 `unmixing_best.pth` 与 `unmixing_best_sam.pth`，确认后续丰度注入是否更受益于综合重建精度还是最低光谱角。
 
 ## 目录结构约定
 
