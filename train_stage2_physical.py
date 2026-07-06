@@ -1,18 +1,18 @@
-"""Train Stage 2 of RAPD-Net: reliable abundance residual injection.
+"""Train Stage 2 of RAPD-Net: reliable abundance and gain correction.
 
-The complete training chain is kept in this one entry script:
+The frozen Stage-1 model provides a normalized material composition map and a
+scene endmember bank. Stage 2 uses HR-MSI frequency reliability to predict:
 
-    frozen Stage-1 unmixing
-        -> abundance-logit bicubic upsampling
-        -> physical HSI/MSI baseline
-        -> SFSR-style SSP/NSP reliability screening
-        -> bounded abundance-logit residual
-        -> physical HR-HSI reconstruction
-        -> HSI, LR, MSI, and spectral-shape closed-loop losses
+1. a bounded abundance-logit residual;
+2. a positive per-pixel illumination/gain map.
 
-Stage 1 is never updated. The script also performs a mandatory Zero-MSI
-ablation during validation so a numerically good result cannot hide an unused
-MSI branch.
+The physical reconstruction is
+
+    X_phy = g_hr * E * A_hr,
+    A_hr >= 0, sum_k A_hr[k] = 1, g_hr > 0.
+
+This is equivalent to a non-negative cone coefficient model while retaining an
+interpretable normalized abundance map.
 """
 
 from __future__ import annotations
@@ -49,11 +49,7 @@ from utils import (
 
 
 class FixedSpatialDegradation(nn.Module):
-    """Differentiable approximation of data_loader.make_lr_hsi.
-
-    It applies a fixed 5x5 Gaussian blur with sigma=2 and bicubic downsampling,
-    matching the LR-HSI generation route used by the current dataset loader.
-    """
+    """Differentiable approximation of the current LR-HSI generation route."""
 
     def __init__(
         self,
@@ -70,8 +66,11 @@ class FixedSpatialDegradation(nn.Module):
         kernel_1d = kernel_1d / kernel_1d.sum()
         kernel_2d = torch.outer(kernel_1d, kernel_1d)
         kernel = kernel_2d.view(1, 1, kernel_size, kernel_size)
-        kernel = kernel.repeat(n_bands, 1, 1, 1)
-        self.register_buffer("kernel", kernel, persistent=False)
+        self.register_buffer(
+            "kernel",
+            kernel.repeat(n_bands, 1, 1, 1),
+            persistent=False,
+        )
         self.padding = kernel_size // 2
         self.n_bands = int(n_bands)
 
@@ -80,10 +79,6 @@ class FixedSpatialDegradation(nn.Module):
         hsi: torch.Tensor,
         target_size: Tuple[int, int],
     ) -> torch.Tensor:
-        if hsi.ndim != 4 or hsi.size(1) != self.n_bands:
-            raise ValueError(
-                f"Expected HSI [N, {self.n_bands}, H, W], got {tuple(hsi.shape)}"
-            )
         padded = F.pad(
             hsi,
             (self.padding, self.padding, self.padding, self.padding),
@@ -111,9 +106,10 @@ def second_spectral_difference(x: torch.Tensor) -> torch.Tensor:
 
 
 def spatial_tv(x: torch.Tensor) -> torch.Tensor:
-    loss_h = (x[:, :, 1:] - x[:, :, :-1]).abs().mean()
-    loss_w = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
-    return loss_h + loss_w
+    return (
+        (x[:, :, 1:] - x[:, :, :-1]).abs().mean()
+        + (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+    )
 
 
 def build_stage1_from_checkpoint(
@@ -121,7 +117,6 @@ def build_stage1_from_checkpoint(
     expected_n_bands: int,
     device: torch.device,
 ) -> Tuple[Stage1UnmixingNet, dict]:
-    """Load Stage 1 with strict architecture and band-count checks."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"Stage-1 checkpoint does not exist: {checkpoint_path}"
@@ -140,8 +135,8 @@ def build_stage1_from_checkpoint(
     n_bands = int(extra.get("n_bands", model_state["endmember_logits"].shape[1]))
     if n_bands != expected_n_bands:
         raise ValueError(
-            f"Stage-1 checkpoint has {n_bands} bands, but the current dataset "
-            f"has {expected_n_bands}. Check dataset and checkpoint paths."
+            f"Stage-1 checkpoint has {n_bands} bands, current data has "
+            f"{expected_n_bands}."
         )
 
     num_endmembers = int(
@@ -174,7 +169,6 @@ def build_stage1_from_checkpoint(
 
 
 def build_spectral_response(info: dict) -> torch.Tensor:
-    """Return an MxB SRF or exact one-hot uniform band selector."""
     n_bands = int(info["n_bands"])
     n_msi = int(info["n_select_bands"])
     srf = info.get("srf_weights")
@@ -187,8 +181,8 @@ def build_spectral_response(info: dict) -> torch.Tensor:
 
     if response.shape != (n_msi, n_bands):
         raise ValueError(
-            f"Invalid spectral response shape {tuple(response.shape)}; "
-            f"expected {(n_msi, n_bands)}"
+            f"Invalid spectral response {tuple(response.shape)}, expected "
+            f"{(n_msi, n_bands)}"
         )
     return response
 
@@ -228,6 +222,8 @@ def compute_losses(
     )
     losses["abundance_delta"] = abundance_delta.abs().mean()
     losses["abundance_tv"] = spatial_tv(abundance_delta)
+    losses["gain_identity"] = outputs["log_gain_residual"].abs().mean()
+    losses["gain_tv"] = spatial_tv(outputs["log_gain_residual"])
 
     losses["lf_alignment"] = outputs["low_frequency_alignment_loss"]
     losses["noise_minimization"] = outputs["noise_minimization_loss"]
@@ -258,6 +254,8 @@ def compute_losses(
         + cfg.stage2_lambda_msi_dc * losses["msi_consistency"]
         + cfg.stage2_lambda_abundance_delta * losses["abundance_delta"]
         + cfg.stage2_lambda_abundance_tv * losses["abundance_tv"]
+        + cfg.stage2_lambda_gain_identity * losses["gain_identity"]
+        + cfg.stage2_lambda_gain_tv * losses["gain_tv"]
         + cfg.stage2_lambda_lf_alignment * losses["lf_alignment"]
         + cfg.stage2_lambda_noise * losses["noise_minimization"]
         + cfg.stage2_lambda_partition * losses["partition"]
@@ -277,6 +275,8 @@ LOSS_NAMES = [
     "msi_consistency",
     "abundance_delta",
     "abundance_tv",
+    "gain_identity",
+    "gain_tv",
     "lf_alignment",
     "noise_minimization",
     "partition",
@@ -304,6 +304,11 @@ MONITOR_NAMES = [
     "freq_high",
     "logit_residual_abs",
     "abundance_change_abs",
+    "log_gain_abs",
+    "gain_mean",
+    "gain_std",
+    "gain_min",
+    "gain_max",
 ]
 
 
@@ -328,6 +333,7 @@ def monitor_values(outputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
     abundance_change = (
         outputs["corrected_abundance"] - outputs["upsampled_abundance"]
     )
+    gain = outputs["gain_map"].detach().float()
     return {
         "noise_ratio": float(outputs["noise_ratio"].detach().item()),
         "reliability_ratio": float(outputs["reliability_ratio"].detach().item()),
@@ -350,6 +356,13 @@ def monitor_values(outputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
         "abundance_change_abs": float(
             abundance_change.detach().abs().mean().item()
         ),
+        "log_gain_abs": float(
+            outputs["log_gain_residual"].detach().abs().mean().item()
+        ),
+        "gain_mean": float(gain.mean().item()),
+        "gain_std": float(gain.std(unbiased=False).item()),
+        "gain_min": float(gain.min().item()),
+        "gain_max": float(gain.max().item()),
     }
 
 
@@ -358,8 +371,7 @@ def update_monitor_meters(
     outputs: Dict[str, torch.Tensor],
     batch_size: int,
 ) -> None:
-    values = monitor_values(outputs)
-    for name, value in values.items():
+    for name, value in monitor_values(outputs).items():
         meters[name].update(value, batch_size)
 
 
@@ -389,7 +401,11 @@ def train_one_epoch(
         losses["total"].backward()
         if cfg.stage2_grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                [
+                    parameter
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ],
                 cfg.stage2_grad_clip,
             )
         optimizer.step()
@@ -433,25 +449,13 @@ def evaluate(
         update_monitor_meters(monitor_meters, outputs, batch_size)
 
         physical_metrics.update(
-            calc_metrics(
-                outputs["physical_hsi"],
-                batch["gt"],
-                cfg.scale_ratio,
-            )
+            calc_metrics(outputs["physical_hsi"], batch["gt"], cfg.scale_ratio)
         )
         base_metrics.update(
-            calc_metrics(
-                outputs["base_hsi"],
-                batch["gt"],
-                cfg.scale_ratio,
-            )
+            calc_metrics(outputs["base_hsi"], batch["gt"], cfg.scale_ratio)
         )
         zero_metrics.update(
-            calc_metrics(
-                outputs["zero_msi_hsi"],
-                batch["gt"],
-                cfg.scale_ratio,
-            )
+            calc_metrics(outputs["zero_msi_hsi"], batch["gt"], cfg.scale_ratio)
         )
 
     result = {
@@ -515,9 +519,13 @@ def export_stage2_artifacts(
         "abundance_logit_residual": outputs[
             "abundance_logit_residual"
         ].detach().cpu().numpy(),
+        "log_gain_residual": outputs["log_gain_residual"].detach().cpu().numpy(),
+        "gain_map": outputs["gain_map"].detach().cpu().numpy(),
+        "cone_coefficients": outputs["cone_coefficients"].detach().cpu().numpy(),
         "base_hsi": outputs["base_hsi"].detach().cpu().numpy(),
         "physical_hsi": outputs["physical_hsi"].detach().cpu().numpy(),
         "zero_msi_hsi": outputs["zero_msi_hsi"].detach().cpu().numpy(),
+        "zero_msi_gain_map": outputs["zero_msi_gain_map"].detach().cpu().numpy(),
         "base_msi": outputs["base_msi"].detach().cpu().numpy(),
         "projected_msi": outputs["projected_msi"].detach().cpu().numpy(),
         "msi_residual": outputs["msi_residual"].detach().cpu().numpy(),
@@ -541,12 +549,16 @@ def export_stage2_artifacts(
     summary = {
         "dataset": cfg.dataset,
         "stage1_checkpoint": cfg.stage1_checkpoint,
+        "max_logit_residual": cfg.stage2_max_logit_residual,
+        "max_log_gain": cfg.stage2_max_log_gain,
         "edge_threshold_mode": cfg.stage2_edge_threshold_mode,
         "edge_mask_threshold": cfg.stage2_edge_mask_threshold,
-        "edge_reference_quantile": cfg.stage2_edge_reference_quantile,
-        "noise_quantile": cfg.stage2_noise_quantile,
         "noise_ratio": float(outputs["noise_ratio"].item()),
         "reliability_ratio": float(outputs["reliability_ratio"].item()),
+        "gain_mean": float(outputs["gain_map"].mean().item()),
+        "gain_std": float(outputs["gain_map"].std(unbiased=False).item()),
+        "gain_min": float(outputs["gain_map"].min().item()),
+        "gain_max": float(outputs["gain_map"].max().item()),
         "tau_low_mean": float(outputs["tau_low"].mean().item()),
         "tau_high_mean": float(outputs["tau_high"].mean().item()),
     }
@@ -573,16 +585,14 @@ def parse_stage2_args():
     parser.add_argument("--stage2_encoder_blocks", type=int, default=3)
     parser.add_argument("--stage2_fusion_channels", type=int, default=96)
     parser.add_argument("--stage2_fusion_blocks", type=int, default=4)
-    parser.add_argument("--stage2_max_logit_residual", type=float, default=0.1)
+    parser.add_argument("--stage2_max_logit_residual", type=float, default=1.0)
+    parser.add_argument("--stage2_max_log_gain", type=float, default=0.7)
 
     parser.add_argument("--stage2_num_frequency_bands", type=int, default=20)
     parser.add_argument("--stage2_init_low_boundary", type=float, default=5.0)
     parser.add_argument("--stage2_init_high_boundary", type=float, default=18.0)
     parser.add_argument("--stage2_boundary_temperature", type=float, default=0.5)
-    parser.add_argument(
-        "--stage2_soft_frequency_partition",
-        action="store_true",
-    )
+    parser.add_argument("--stage2_soft_frequency_partition", action="store_true")
 
     parser.add_argument(
         "--stage2_edge_threshold_mode",
@@ -605,6 +615,8 @@ def parse_stage2_args():
     parser.add_argument("--stage2_lambda_msi_dc", type=float, default=0.2)
     parser.add_argument("--stage2_lambda_abundance_delta", type=float, default=0.001)
     parser.add_argument("--stage2_lambda_abundance_tv", type=float, default=0.001)
+    parser.add_argument("--stage2_lambda_gain_identity", type=float, default=0.001)
+    parser.add_argument("--stage2_lambda_gain_tv", type=float, default=0.005)
     parser.add_argument("--stage2_lambda_lf_alignment", type=float, default=0.05)
     parser.add_argument("--stage2_lambda_noise", type=float, default=0.01)
     parser.add_argument("--stage2_lambda_partition", type=float, default=0.01)
@@ -622,14 +634,11 @@ def parse_stage2_args():
     for key, value in vars(stage_args).items():
         setattr(cfg, key, value)
 
-    # Stage 2 is designed around a known sensor response. Keep uniform sampling
-    # available for ablation, but default this entrypoint to WV2 visible6 SRF.
     if not _has_option(remaining, "--msi_mode"):
         cfg.msi_mode = "srf"
     if not _has_option(remaining, "--srf_band_set"):
         cfg.srf_band_set = "wv2_visible6"
 
-    # Make the default Stage-1 path follow a non-PaviaU dataset automatically.
     default_stage1 = "./checkpoints/stage1_unmix/PaviaU/unmixing_best.pth"
     if cfg.stage1_checkpoint == default_stage1 and cfg.dataset != "PaviaU":
         cfg.stage1_checkpoint = os.path.join(
@@ -643,7 +652,7 @@ def parse_stage2_args():
 
 def checkpoint_extra(cfg, info: dict, stage1_state: dict, result: dict) -> dict:
     return {
-        "stage": "physical",
+        "stage": "physical_cone",
         "dataset": cfg.dataset,
         "n_bands": int(info["n_bands"]),
         "n_msi_bands": int(info["n_select_bands"]),
@@ -656,6 +665,7 @@ def checkpoint_extra(cfg, info: dict, stage1_state: dict, result: dict) -> dict:
         "fusion_channels": cfg.stage2_fusion_channels,
         "fusion_blocks": cfg.stage2_fusion_blocks,
         "max_logit_residual": cfg.stage2_max_logit_residual,
+        "max_log_gain": cfg.stage2_max_log_gain,
         "edge_threshold_mode": cfg.stage2_edge_threshold_mode,
         "edge_mask_threshold": cfg.stage2_edge_mask_threshold,
         "edge_reference_quantile": cfg.stage2_edge_reference_quantile,
@@ -685,6 +695,7 @@ def main() -> None:
         fusion_channels=cfg.stage2_fusion_channels,
         fusion_blocks=cfg.stage2_fusion_blocks,
         max_logit_residual=cfg.stage2_max_logit_residual,
+        max_log_gain=cfg.stage2_max_log_gain,
         num_frequency_bands=cfg.stage2_num_frequency_bands,
         init_low_boundary=cfg.stage2_init_low_boundary,
         init_high_boundary=cfg.stage2_init_high_boundary,
@@ -699,10 +710,7 @@ def main() -> None:
     boundary_lr = cfg.lr * cfg.stage2_boundary_lr_multiplier
     optimizer = torch.optim.AdamW(
         [
-            {
-                "params": list(model.regular_parameters()),
-                "lr": cfg.lr,
-            },
+            {"params": list(model.regular_parameters()), "lr": cfg.lr},
             {
                 "params": list(model.spectral_boundary_parameters()),
                 "lr": boundary_lr,
@@ -720,15 +728,9 @@ def main() -> None:
     degrader = FixedSpatialDegradation(info["n_bands"]).to(device)
 
     checkpoint_dir = os.path.join(
-        cfg.checkpoint_root,
-        "stage2_physical",
-        cfg.dataset,
+        cfg.checkpoint_root, "stage2_physical", cfg.dataset
     )
-    output_dir = os.path.join(
-        cfg.output_root,
-        "stage2_physical",
-        cfg.dataset,
-    )
+    output_dir = os.path.join(cfg.output_root, "stage2_physical", cfg.dataset)
     log_dir = os.path.join(cfg.log_root, "stage2_physical")
     ensure_dir(checkpoint_dir)
     ensure_dir(output_dir)
@@ -759,28 +761,17 @@ def main() -> None:
         "zero_msi_psnr_drop",
         "zero_msi_sam_drop",
         "selection",
-        "noise_ratio",
-        "reliability_ratio",
-        "edge_q10",
-        "edge_q50",
-        "edge_q90",
-        "edge_q99",
-        "tau_low_mean",
-        "tau_high_mean",
-        "freq_low",
-        "freq_mid",
-        "freq_high",
-        "logit_residual_abs",
-        "abundance_change_abs",
+        *MONITOR_NAMES,
         "lr_consistency",
         "msi_consistency",
+        "gain_identity",
+        "gain_tv",
         "lf_alignment",
         "noise_minimization",
         "msi_usage",
     ]
     csv_logger = CSVLogger(
-        os.path.join(log_dir, f"{cfg.dataset}.csv"),
-        csv_fields,
+        os.path.join(log_dir, f"{cfg.dataset}.csv"), csv_fields
     )
 
     start_epoch = 0
@@ -788,58 +779,36 @@ def main() -> None:
     best_sam = float("inf")
     best_psnr = -float("inf")
     if cfg.resume:
-        if not os.path.exists(cfg.resume):
-            raise FileNotFoundError(f"Resume checkpoint not found: {cfg.resume}")
         start_epoch, best_selection = load_checkpoint(
             model,
             cfg.resume,
             optimizer=optimizer,
             map_location=str(device),
         )
-        # Explicitly honor a new command-line LR after loading optimizer state.
         optimizer.param_groups[0]["lr"] = cfg.lr
         optimizer.param_groups[1]["lr"] = boundary_lr
         write_log(
             log_path,
-            f"Resumed Stage 2 from {cfg.resume} at epoch {start_epoch}; "
-            f"reset lr={cfg.lr:.3e}, boundary_lr={boundary_lr:.3e}.",
+            f"Resumed from {cfg.resume} at epoch {start_epoch}; "
+            f"lr={cfg.lr:.3e}, boundary_lr={boundary_lr:.3e}.",
         )
 
     write_log(
         log_path,
-        f"Stage 2 start | dataset={cfg.dataset}, HSI={info['n_bands']}, "
+        f"Stage 2 cone start | dataset={cfg.dataset}, HSI={info['n_bands']}, "
         f"MSI={info['n_select_bands']}, mode={info['msi_mode']}, "
         f"Stage1={cfg.stage1_checkpoint} (epoch {stage1_state.get('epoch', -1)}), "
+        f"max_logit={cfg.stage2_max_logit_residual}, "
+        f"max_log_gain={cfg.stage2_max_log_gain}, "
         f"trainable={count_parameters(model):.3f} M.",
-    )
-    write_log(
-        log_path,
-        f"Reliability | mode={cfg.stage2_edge_threshold_mode}, "
-        f"threshold={cfg.stage2_edge_mask_threshold}, "
-        f"reference_q={cfg.stage2_edge_reference_quantile}, "
-        f"noise_q={cfg.stage2_noise_quantile}, "
-        f"frequency_bands={cfg.stage2_num_frequency_bands}, "
-        f"tau_init=({cfg.stage2_init_low_boundary}, "
-        f"{cfg.stage2_init_high_boundary}).",
     )
 
     for epoch in range(start_epoch, cfg.epochs):
         train_result = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            degrader,
-            sam_loss,
-            cfg,
-            device,
+            model, train_loader, optimizer, degrader, sam_loss, cfg, device
         )
         val_result = evaluate(
-            model,
-            test_loader,
-            degrader,
-            sam_loss,
-            cfg,
-            device,
+            model, test_loader, degrader, sam_loss, cfg, device
         )
         scheduler.step()
 
@@ -858,6 +827,7 @@ def main() -> None:
             f"Zero-MSI drop=({val_result['zero_msi_psnr_drop']:+.4f} dB, "
             f"{val_result['zero_msi_sam_drop']:+.4f} deg) | "
             f"noise={val_result['noise_ratio']:.4f}, "
+            f"gain={val_result['gain_mean']:.3f}±{val_result['gain_std']:.3f}, "
             f"tau=({val_result['tau_low_mean']:.3f}, "
             f"{val_result['tau_high_mean']:.3f}).",
         )
@@ -865,59 +835,52 @@ def main() -> None:
         if val_result["noise_ratio"] < 0.005:
             write_log(
                 log_path,
-                "WARNING: NSP noise_ratio < 0.005; reliability map is nearly all 1.",
+                "WARNING: NSP reliability map is nearly all 1.",
             )
         elif val_result["noise_ratio"] > 0.95:
             write_log(
                 log_path,
-                "WARNING: NSP noise_ratio > 0.95; almost all high frequency is removed.",
+                "WARNING: NSP removes almost all high frequency.",
             )
         if abs(val_result["zero_msi_psnr_drop"]) < 0.01:
             write_log(
                 log_path,
-                "WARNING: Zero-MSI PSNR drop is below 0.01 dB; MSI usage is weak.",
+                "WARNING: Zero-MSI PSNR drop < 0.01 dB; MSI usage is weak.",
             )
+        if val_result["gain_min"] < math.exp(-0.95 * cfg.stage2_max_log_gain):
+            write_log(log_path, "WARNING: gain approaches its lower bound.")
+        if val_result["gain_max"] > math.exp(0.95 * cfg.stage2_max_log_gain):
+            write_log(log_path, "WARNING: gain approaches its upper bound.")
 
-        csv_logger.write(
-            {
-                "epoch": epoch + 1,
-                "lr": optimizer.param_groups[0]["lr"],
-                "boundary_lr": optimizer.param_groups[1]["lr"],
-                "train_total": train_result["total"],
-                "train_l1": train_result["hsi_l1"],
-                "train_sam_deg": train_sam_deg,
-                "val_l1": val_result["hsi_l1"],
-                "val_sam_deg": val_sam_deg,
-                "val_psnr": val_result["physical_psnr"],
-                "base_psnr": val_result["base_psnr"],
-                "base_sam": val_result["base_sam"],
-                "psnr_gain_over_base": val_result["psnr_gain_over_base"],
-                "sam_gain_over_base": val_result["sam_gain_over_base"],
-                "zero_psnr": val_result["zero_psnr"],
-                "zero_sam": val_result["zero_sam"],
-                "zero_msi_psnr_drop": val_result["zero_msi_psnr_drop"],
-                "zero_msi_sam_drop": val_result["zero_msi_sam_drop"],
-                "selection": val_result["selection"],
-                "noise_ratio": val_result["noise_ratio"],
-                "reliability_ratio": val_result["reliability_ratio"],
-                "edge_q10": val_result["edge_q10"],
-                "edge_q50": val_result["edge_q50"],
-                "edge_q90": val_result["edge_q90"],
-                "edge_q99": val_result["edge_q99"],
-                "tau_low_mean": val_result["tau_low_mean"],
-                "tau_high_mean": val_result["tau_high_mean"],
-                "freq_low": val_result["freq_low"],
-                "freq_mid": val_result["freq_mid"],
-                "freq_high": val_result["freq_high"],
-                "logit_residual_abs": val_result["logit_residual_abs"],
-                "abundance_change_abs": val_result["abundance_change_abs"],
-                "lr_consistency": val_result["lr_consistency"],
-                "msi_consistency": val_result["msi_consistency"],
-                "lf_alignment": val_result["lf_alignment"],
-                "noise_minimization": val_result["noise_minimization"],
-                "msi_usage": val_result["msi_usage"],
-            }
-        )
+        row = {
+            "epoch": epoch + 1,
+            "lr": optimizer.param_groups[0]["lr"],
+            "boundary_lr": optimizer.param_groups[1]["lr"],
+            "train_total": train_result["total"],
+            "train_l1": train_result["hsi_l1"],
+            "train_sam_deg": train_sam_deg,
+            "val_l1": val_result["hsi_l1"],
+            "val_sam_deg": val_sam_deg,
+            "val_psnr": val_result["physical_psnr"],
+            "base_psnr": val_result["base_psnr"],
+            "base_sam": val_result["base_sam"],
+            "psnr_gain_over_base": val_result["psnr_gain_over_base"],
+            "sam_gain_over_base": val_result["sam_gain_over_base"],
+            "zero_psnr": val_result["zero_psnr"],
+            "zero_sam": val_result["zero_sam"],
+            "zero_msi_psnr_drop": val_result["zero_msi_psnr_drop"],
+            "zero_msi_sam_drop": val_result["zero_msi_sam_drop"],
+            "selection": val_result["selection"],
+            "lr_consistency": val_result["lr_consistency"],
+            "msi_consistency": val_result["msi_consistency"],
+            "gain_identity": val_result["gain_identity"],
+            "gain_tv": val_result["gain_tv"],
+            "lf_alignment": val_result["lf_alignment"],
+            "noise_minimization": val_result["noise_minimization"],
+            "msi_usage": val_result["msi_usage"],
+        }
+        row.update({name: val_result[name] for name in MONITOR_NAMES})
+        csv_logger.write(row)
 
         extra = checkpoint_extra(cfg, info, stage1_state, val_result)
         if val_result["selection"] < best_selection:
@@ -930,7 +893,7 @@ def main() -> None:
                 best_path,
                 extra=extra,
             )
-            write_log(log_path, f"Saved Stage-2 best checkpoint: {best_path}")
+            write_log(log_path, f"Saved Stage-2 best: {best_path}")
 
         if val_result["physical_sam"] < best_sam:
             best_sam = val_result["physical_sam"]
@@ -942,7 +905,6 @@ def main() -> None:
                 best_sam_path,
                 extra=extra,
             )
-            write_log(log_path, f"Saved Stage-2 lowest-SAM: {best_sam_path}")
 
         if val_result["physical_psnr"] > best_psnr:
             best_psnr = val_result["physical_psnr"]
@@ -954,7 +916,6 @@ def main() -> None:
                 best_psnr_path,
                 extra=extra,
             )
-            write_log(log_path, f"Saved Stage-2 highest-PSNR: {best_psnr_path}")
 
         save_checkpoint(
             model,
@@ -973,12 +934,7 @@ def main() -> None:
         load_optimizer=False,
     )
     final_result = evaluate(
-        model,
-        test_loader,
-        degrader,
-        sam_loss,
-        cfg,
-        device,
+        model, test_loader, degrader, sam_loss, cfg, device
     )
     export_stage2_artifacts(model, test_loader, cfg, output_dir, device)
     with open(
@@ -992,8 +948,7 @@ def main() -> None:
         f"Stage 2 complete | PSNR={final_result['physical_psnr']:.4f}, "
         f"SAM={final_result['physical_sam']:.4f} deg, "
         f"base gain={final_result['psnr_gain_over_base']:+.4f} dB, "
-        f"Zero-MSI drop={final_result['zero_msi_psnr_drop']:+.4f} dB. "
-        f"Artifacts: {output_dir}",
+        f"Zero-MSI drop={final_result['zero_msi_psnr_drop']:+.4f} dB.",
     )
 
 
