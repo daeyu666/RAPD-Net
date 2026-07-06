@@ -4,15 +4,23 @@ Stage 2 freezes the Stage-1 LR-HSI unmixing model and learns only:
 
 1. SFSR-style frequency reliability screening of HR-MSI;
 2. bounded abundance-logit residual injection;
-3. high-resolution physical reconstruction with the frozen endmember bank.
+3. a positive per-pixel illumination/gain field;
+4. high-resolution physical reconstruction with the frozen endmember bank.
 
-The implementation deliberately keeps the complete physical chain in one file
-instead of splitting every operation into a separate module.
+The gain field relaxes the overly restrictive abundance-sum-to-one brightness
+assumption while preserving a normalized material-composition abundance map:
+
+    X_phy = g_hr * E * A_hr,
+    A_hr >= 0, sum_k A_hr[k] = 1, g_hr > 0.
+
+Equivalently, C_hr = g_hr * A_hr is a non-negative cone coefficient map. This
+matches the representation-ceiling diagnosis without turning the abundance map
+into unconstrained signed coefficients.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -30,7 +38,7 @@ def _group_count(channels: int) -> int:
 
 
 class ResidualFusionBlock(nn.Module):
-    """Compact residual block for the abundance-logit correction trunk."""
+    """Compact residual block for abundance and gain correction."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -49,30 +57,7 @@ class ResidualFusionBlock(nn.Module):
 
 
 class Stage2PhysicalFusionNet(nn.Module):
-    """Frozen physical unmixing + reliable MSI abundance correction.
-
-    Args:
-        stage1_model:
-            Trained Stage-1 model. It is frozen permanently in this stage.
-        spectral_response:
-            MSI projection matrix with shape ``[M, B]``. For uniform MSI this
-            can be a one-hot band-selection matrix.
-        feature_channels:
-            Width of the shared MSI encoder and reliability features.
-        fusion_channels:
-            Width of the abundance-residual fusion trunk.
-        max_logit_residual:
-            Maximum absolute correction added to each abundance logit.
-
-    Inputs:
-        lr_hsi: ``[N, B, h, w]``.
-        hr_msi: ``[N, M, H, W]``.
-
-    Outputs:
-        Complete Stage-2 intermediate state, including frozen Stage-1 outputs,
-        SSP/NSP features, reliability maps, abundance residuals, and physical
-        HSI/MSI reconstructions.
-    """
+    """Frozen physical unmixing + reliable MSI abundance/gain correction."""
 
     def __init__(
         self,
@@ -82,7 +67,8 @@ class Stage2PhysicalFusionNet(nn.Module):
         encoder_blocks: int = 3,
         fusion_channels: int = 96,
         fusion_blocks: int = 4,
-        max_logit_residual: float = 0.1,
+        max_logit_residual: float = 1.0,
+        max_log_gain: float = 0.7,
         num_frequency_bands: int = 20,
         init_low_boundary: float = 5.0,
         init_high_boundary: float = 18.0,
@@ -106,6 +92,8 @@ class Stage2PhysicalFusionNet(nn.Module):
             )
         if max_logit_residual <= 0:
             raise ValueError("max_logit_residual must be positive")
+        if max_log_gain <= 0:
+            raise ValueError("max_log_gain must be positive")
 
         self.stage1 = stage1_model
         self.n_bands = int(stage1_model.n_bands)
@@ -113,6 +101,7 @@ class Stage2PhysicalFusionNet(nn.Module):
         self.msi_channels = int(spectral_response.size(0))
         self.feature_channels = int(feature_channels)
         self.max_logit_residual = float(max_logit_residual)
+        self.max_log_gain = float(max_log_gain)
 
         self.register_buffer(
             "spectral_response",
@@ -177,7 +166,7 @@ class Stage2PhysicalFusionNet(nn.Module):
 
         fusion_in_channels = feature_channels * 5 + 1
         fusion_groups = _group_count(fusion_channels)
-        self.abundance_residual_trunk = nn.Sequential(
+        self.physical_correction_trunk = nn.Sequential(
             nn.Conv2d(
                 fusion_in_channels,
                 fusion_channels,
@@ -194,9 +183,19 @@ class Stage2PhysicalFusionNet(nn.Module):
             3,
             padding=1,
         )
-        # Start Stage 2 exactly from the frozen Stage-1 physical baseline.
+        self.log_gain_head = nn.Conv2d(
+            fusion_channels,
+            1,
+            3,
+            padding=1,
+        )
+
+        # Stage 2 starts exactly from the frozen Stage-1 physical baseline:
+        # abundance residual = 0 and gain = exp(0) = 1.
         nn.init.zeros_(self.abundance_residual_head.weight)
         nn.init.zeros_(self.abundance_residual_head.bias)
+        nn.init.zeros_(self.log_gain_head.weight)
+        nn.init.zeros_(self.log_gain_head.bias)
 
     def _freeze_stage1(self) -> None:
         self.stage1.eval()
@@ -205,8 +204,6 @@ class Stage2PhysicalFusionNet(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # ``super().train`` would switch every child to train mode. Keep the
-        # physical basis deterministic and frozen regardless of Stage-2 mode.
         self.stage1.eval()
         return self
 
@@ -221,11 +218,11 @@ class Stage2PhysicalFusionNet(nn.Module):
     @staticmethod
     def reconstruct_hsi(
         endmembers: torch.Tensor,
-        abundance: torch.Tensor,
+        coefficients: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.einsum("bk,nkhw->nbhw", endmembers, abundance)
+        return torch.einsum("bk,nkhw->nbhw", endmembers, coefficients)
 
-    def _predict_abundance_residual(
+    def _predict_physical_correction(
         self,
         upsampled_logits: torch.Tensor,
         physical_feature: torch.Tensor,
@@ -251,17 +248,29 @@ class Stage2PhysicalFusionNet(nn.Module):
             ],
             dim=1,
         )
-        hidden = self.abundance_residual_trunk(fused)
-        raw_residual = self.abundance_residual_head(hidden)
-        bounded_residual = self.max_logit_residual * torch.tanh(raw_residual)
-        corrected_logits = upsampled_logits + bounded_residual
+        hidden = self.physical_correction_trunk(fused)
+
+        raw_abundance_residual = self.abundance_residual_head(hidden)
+        abundance_logit_residual = self.max_logit_residual * torch.tanh(
+            raw_abundance_residual
+        )
+        corrected_logits = upsampled_logits + abundance_logit_residual
         corrected_abundance = torch.softmax(corrected_logits, dim=1)
 
+        raw_log_gain = self.log_gain_head(hidden)
+        log_gain_residual = self.max_log_gain * torch.tanh(raw_log_gain)
+        gain_map = torch.exp(log_gain_residual)
+        cone_coefficients = gain_map * corrected_abundance
+
         return {
-            "raw_abundance_logit_residual": raw_residual,
-            "abundance_logit_residual": bounded_residual,
+            "raw_abundance_logit_residual": raw_abundance_residual,
+            "abundance_logit_residual": abundance_logit_residual,
             "corrected_abundance_logits": corrected_logits,
             "corrected_abundance": corrected_abundance,
+            "raw_log_gain": raw_log_gain,
+            "log_gain_residual": log_gain_residual,
+            "gain_map": gain_map,
+            "cone_coefficients": cone_coefficients,
         }
 
     def forward(
@@ -303,7 +312,7 @@ class Stage2PhysicalFusionNet(nn.Module):
         msi_residual = hr_msi - base_msi
 
         reliability = self.reliability(base_msi, hr_msi)
-        abundance_correction = self._predict_abundance_residual(
+        physical_correction = self._predict_physical_correction(
             upsampled_logits=upsampled_logits,
             physical_feature=reliability["physical_feature"],
             mid_feature=reliability["mid_feature"],
@@ -314,7 +323,7 @@ class Stage2PhysicalFusionNet(nn.Module):
 
         physical_hsi = self.reconstruct_hsi(
             endmembers,
-            abundance_correction["corrected_abundance"],
+            physical_correction["cone_coefficients"],
         )
         projected_msi = self.project_hsi_to_msi(physical_hsi)
 
@@ -331,14 +340,14 @@ class Stage2PhysicalFusionNet(nn.Module):
             "physical_hsi": physical_hsi,
             "projected_msi": projected_msi,
             **reliability,
-            **abundance_correction,
+            **physical_correction,
         }
 
         if compute_zero_msi:
             zeros_feature = torch.zeros_like(reliability["mid_feature"])
             zeros_map = torch.zeros_like(reliability["reliability_map"])
             zeros_msi = torch.zeros_like(msi_residual)
-            zero_correction = self._predict_abundance_residual(
+            zero_correction = self._predict_physical_correction(
                 upsampled_logits=upsampled_logits,
                 physical_feature=reliability["physical_feature"],
                 mid_feature=zeros_feature,
@@ -348,7 +357,7 @@ class Stage2PhysicalFusionNet(nn.Module):
             )
             zero_hsi = self.reconstruct_hsi(
                 endmembers,
-                zero_correction["corrected_abundance"],
+                zero_correction["cone_coefficients"],
             )
             output.update(
                 {
@@ -357,6 +366,13 @@ class Stage2PhysicalFusionNet(nn.Module):
                     ],
                     "zero_msi_abundance": zero_correction[
                         "corrected_abundance"
+                    ],
+                    "zero_msi_log_gain_residual": zero_correction[
+                        "log_gain_residual"
+                    ],
+                    "zero_msi_gain_map": zero_correction["gain_map"],
+                    "zero_msi_cone_coefficients": zero_correction[
+                        "cone_coefficients"
                     ],
                     "zero_msi_hsi": zero_hsi,
                     "zero_msi_projected_msi": self.project_hsi_to_msi(zero_hsi),
