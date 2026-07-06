@@ -7,6 +7,7 @@ from .stage2_frequency_reliability import (
     NoiseSplitter,
     SharedMSIFeatureEncoder,
 )
+from .stage2_physical_fusion import Stage2PhysicalFusionNet
 
 __all__ = [
     "Stage1UnmixingNet",
@@ -14,4 +15,5 @@ __all__ = [
     "ChannelWiseSpectralSplitter",
     "NoiseSplitter",
     "FrequencyReliabilityScreen",
+    "Stage2PhysicalFusionNet",
 ]
