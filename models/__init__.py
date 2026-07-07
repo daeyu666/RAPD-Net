@@ -10,11 +10,13 @@ from .stage2_frequency_reliability import (
     SharedMSIFeatureEncoder,
 )
 from .stage2_physical_fusion import Stage2PhysicalFusionNet
+from .stage2_srf_anchor import Stage2SRFAnchorNet
 
 __all__ = [
     "Stage1SpectralBasisNet",
     "Stage1UnmixingNet",
     "Stage2CoefficientResidualNet",
+    "Stage2SRFAnchorNet",
     "SharedMSIFeatureEncoder",
     "ChannelWiseSpectralSplitter",
     "NoiseSplitter",
