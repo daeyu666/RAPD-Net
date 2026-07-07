@@ -1,22 +1,24 @@
-"""Coarse-to-fine dual-space coefficient residual pyramid for Stage 2.
+"""Residual-of-residual coarse-to-fine coefficient pyramid for Stage 2.
 
-This module extends ``Stage2SymmetricFrequencyNet`` with two additional
-low-resolution refinement levels while preserving the trained full-resolution
-path exactly at initialization.
+The trained symmetric-frequency model is preserved as a source predictor:
 
-The hierarchy is
+    Delta C_source = G_source(C_anchor, frequency differences).
 
-    quarter residual -> half residual -> full residual,
+Three new zero-initialized correction levels predict only the remaining target
+error after the source residual:
 
-where every level predicts observable- and null-space coefficient residuals.
-The quarter and half heads are zero-initialized, so a warm-start from the
-single-scale symmetric-frequency checkpoint reproduces the source prediction
-before fine-tuning.
+    Delta C_final = Delta C_source
+                  + Up(Delta C_quarter)
+                  + Up(Delta C_half)
+                  + Delta C_full_correction.
+
+Each correction level retains the exact observable/null-space decomposition.
+The source residual is detached when it is used as correction context so the
+new branches cannot destabilize the mature source path through their inputs.
 """
 
 from __future__ import annotations
 
-import copy
 from typing import Dict, Tuple
 
 import torch
@@ -49,7 +51,7 @@ def resize_antialiased(
 
 
 class PyramidDualScaleBranch(nn.Module):
-    """One observable/null-space coefficient refinement branch."""
+    """One zero-initialized observable/null-space correction branch."""
 
     def __init__(
         self,
@@ -132,15 +134,22 @@ class PyramidDualScaleBranch(nn.Module):
         nn.init.zeros_(self.null_head.bias)
 
     @torch.no_grad()
-    def initialize_trunk_from_full(self, parent: Stage2SymmetricFrequencyNet) -> None:
-        self.coefficient_context.load_state_dict(parent.coefficient_context.state_dict())
+    def initialize_trunk_from_full(
+        self,
+        parent: Stage2SymmetricFrequencyNet,
+    ) -> None:
+        self.coefficient_context.load_state_dict(
+            parent.coefficient_context.state_dict()
+        )
         self.physical_context_adapter.load_state_dict(
             parent.physical_context_adapter.state_dict()
         )
         self.low_discrepancy_adapter.load_state_dict(
             parent.low_discrepancy_adapter.state_dict()
         )
-        self.mid_detail_adapter.load_state_dict(parent.mid_detail_adapter.state_dict())
+        self.mid_detail_adapter.load_state_dict(
+            parent.mid_detail_adapter.state_dict()
+        )
         self.high_detail_adapter.load_state_dict(
             parent.high_detail_adapter.state_dict()
         )
@@ -148,7 +157,10 @@ class PyramidDualScaleBranch(nn.Module):
         self.zero_heads()
 
     @staticmethod
-    def _project(projector: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+    def _project(
+        projector: torch.Tensor,
+        coefficients: torch.Tensor,
+    ) -> torch.Tensor:
         return torch.einsum("rk,nkhw->nrhw", projector, coefficients)
 
     def forward(
@@ -214,7 +226,7 @@ class PyramidDualScaleBranch(nn.Module):
 
 
 class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
-    """Symmetric-frequency Stage 2 with quarter/half/full refinement levels."""
+    """Source predictor plus quarter/half/full residual correction pyramid."""
 
     def __init__(
         self,
@@ -234,25 +246,22 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
         self.pyramid_quarter_scale = float(pyramid_quarter_scale)
         self.pyramid_half_scale = float(pyramid_half_scale)
 
-        self.quarter_branch = PyramidDualScaleBranch(
-            basis_rank=self.basis_rank,
-            feature_channels=feature_channels,
-            fusion_channels=fusion_channels,
-            fusion_blocks=fusion_blocks,
-            max_normalized_residual=self.max_normalized_residual,
-        )
-        self.half_branch = PyramidDualScaleBranch(
-            basis_rank=self.basis_rank,
-            feature_channels=feature_channels,
-            fusion_channels=fusion_channels,
-            fusion_blocks=fusion_blocks,
-            max_normalized_residual=self.max_normalized_residual,
-        )
+        branch_kwargs = {
+            "basis_rank": self.basis_rank,
+            "feature_channels": feature_channels,
+            "fusion_channels": fusion_channels,
+            "fusion_blocks": fusion_blocks,
+            "max_normalized_residual": self.max_normalized_residual,
+        }
+        self.quarter_branch = PyramidDualScaleBranch(**branch_kwargs)
+        self.half_branch = PyramidDualScaleBranch(**branch_kwargs)
+        self.full_correction_branch = PyramidDualScaleBranch(**branch_kwargs)
 
     @torch.no_grad()
     def initialize_pyramid_from_full(self) -> None:
         self.quarter_branch.initialize_trunk_from_full(self)
         self.half_branch.initialize_trunk_from_full(self)
+        self.full_correction_branch.initialize_trunk_from_full(self)
 
     @staticmethod
     def _scaled_size(
@@ -287,7 +296,7 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
             "reliability": resize_antialiased(reliability_map, size),
         }
 
-    def _full_dual_residual(
+    def _source_residual(
         self,
         normalized_coefficients: torch.Tensor,
         physical_feature: torch.Tensor,
@@ -315,13 +324,36 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
         reliability_map: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         full_size = tuple(normalized_upsampled_coefficients.shape[-2:])
-        quarter_size = self._scaled_size(full_size, self.pyramid_quarter_scale)
-        half_size = self._scaled_size(full_size, self.pyramid_half_scale)
+        quarter_size = self._scaled_size(
+            full_size,
+            self.pyramid_quarter_scale,
+        )
+        half_size = self._scaled_size(
+            full_size,
+            self.pyramid_half_scale,
+        )
         scale = self.coefficient_scale()
+        scale_view = scale.view(1, -1, 1, 1)
+
+        # Preserve the mature single-scale path exactly. The detached copy is
+        # only correction context; the non-detached source remains in the final
+        # sum so low-rate joint fine-tuning can still update the source branch.
+        source = self._source_residual(
+            normalized_coefficients=normalized_upsampled_coefficients,
+            physical_feature=physical_feature,
+            low_feature=low_discrepancy_feature,
+            mid_feature=mid_feature,
+            high_feature=reliable_high_feature,
+            reliability_map=reliability_map,
+        )
+        source_context = source["normalized_coefficient_residual"].detach()
+        corrected_source_coefficients = (
+            normalized_upsampled_coefficients + source_context
+        )
 
         quarter_inputs = self._resize_feature_dict(
             quarter_size,
-            normalized_upsampled_coefficients,
+            corrected_source_coefficients,
             physical_feature,
             low_discrepancy_feature,
             mid_feature,
@@ -342,7 +374,7 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
 
         half_inputs = self._resize_feature_dict(
             half_size,
-            normalized_upsampled_coefficients,
+            corrected_source_coefficients,
             physical_feature,
             low_discrepancy_feature,
             mid_feature,
@@ -376,15 +408,18 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
             mode="bicubic",
         )
 
-        full = self._full_dual_residual(
+        full_correction = self.full_correction_branch(
             normalized_coefficients=(
-                normalized_upsampled_coefficients + half_to_full_normalized
+                corrected_source_coefficients + half_to_full_normalized
             ),
             physical_feature=physical_feature,
             low_feature=low_discrepancy_feature,
             mid_feature=mid_feature,
             high_feature=reliable_high_feature,
             reliability_map=reliability_map,
+            coefficient_scale=scale,
+            observable_projector=self.exact_observable_projector,
+            null_projector=self.exact_null_projector,
         )
 
         quarter_observable_full = resize_antialiased(
@@ -408,35 +443,50 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
             mode="bicubic",
         )
 
-        observable_total = (
+        correction_observable = (
             quarter_observable_full
             + half_observable_full
-            + full["observable_coefficient_residual"]
+            + full_correction["observable"]
         )
-        null_total = (
+        correction_null = (
             quarter_null_full
             + half_null_full
-            + full["null_coefficient_residual"]
+            + full_correction["null"]
         )
+        correction_total = correction_observable + correction_null
+
+        observable_total = (
+            source["observable_coefficient_residual"]
+            + correction_observable
+        )
+        null_total = source["null_coefficient_residual"] + correction_null
         coefficient_total = observable_total + null_total
-        scale_view = scale.view(1, -1, 1, 1)
-        normalized_observable_total = observable_total / scale_view
-        normalized_null_total = null_total / scale_view
-        normalized_total = coefficient_total / scale_view
 
         return {
-            "raw_normalized_coefficient_residual": full[
+            "raw_normalized_coefficient_residual": source[
                 "raw_normalized_coefficient_residual"
             ],
             "normalized_observable_coefficient_residual": (
-                normalized_observable_total
+                observable_total / scale_view
             ),
-            "normalized_null_coefficient_residual": normalized_null_total,
+            "normalized_null_coefficient_residual": null_total / scale_view,
             "observable_coefficient_residual": observable_total,
             "null_coefficient_residual": null_total,
-            "normalized_coefficient_residual": normalized_total,
+            "normalized_coefficient_residual": coefficient_total / scale_view,
             "coefficient_residual": coefficient_total,
             "observable_rank": self.observable_rank.to(coefficient_total.device),
+            "pyramid_source_normalized_residual": source[
+                "normalized_coefficient_residual"
+            ],
+            "pyramid_source_observable_residual": source[
+                "observable_coefficient_residual"
+            ],
+            "pyramid_source_null_residual": source[
+                "null_coefficient_residual"
+            ],
+            "pyramid_source_coefficient_residual": source[
+                "coefficient_residual"
+            ],
             "pyramid_quarter_normalized_residual": quarter["normalized_total"],
             "pyramid_quarter_observable_residual": quarter["observable"],
             "pyramid_quarter_null_residual": quarter["null"],
@@ -448,15 +498,19 @@ class Stage2MultiScalePyramidNet(Stage2SymmetricFrequencyNet):
             ),
             "pyramid_half_increment_observable_residual": half["observable"],
             "pyramid_half_increment_null_residual": half["null"],
-            "pyramid_full_increment_normalized_residual": full[
-                "normalized_coefficient_residual"
+            "pyramid_full_correction_normalized_residual": full_correction[
+                "normalized_total"
             ],
-            "pyramid_full_increment_observable_residual": full[
-                "observable_coefficient_residual"
+            "pyramid_full_correction_observable_residual": full_correction[
+                "observable"
             ],
-            "pyramid_full_increment_null_residual": full[
-                "null_coefficient_residual"
-            ],
+            "pyramid_full_correction_null_residual": full_correction["null"],
+            "pyramid_correction_normalized_residual": (
+                correction_total / scale_view
+            ),
+            "pyramid_correction_observable_residual": correction_observable,
+            "pyramid_correction_null_residual": correction_null,
+            "pyramid_correction_coefficient_residual": correction_total,
             "pyramid_quarter_size": coefficient_total.new_tensor(
                 quarter_size,
                 dtype=torch.int64,
