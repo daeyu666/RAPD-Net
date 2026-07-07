@@ -1,9 +1,14 @@
-"""Fine-tune Stage 2 with a coarse-to-fine dual-space coefficient pyramid.
+"""Train the residual-of-residual multiscale coefficient pyramid.
 
-The source is a trained symmetric-frequency checkpoint. All existing weights
-are transferred, the quarter/half trunks are initialized from the full branch,
-and their output heads are zeroed. The initial prediction therefore reproduces
-the source model before the new pyramid levels begin learning.
+A trained symmetric-frequency model remains the source predictor. New
+quarter/half/full correction branches are initialized with copied trunks and
+zero output heads, then learn only the coefficient error left by the source.
+
+Training schedule:
+1. correction-only warm-up: source and SSP boundaries are frozen;
+2. low-rate joint fine-tuning: source is unfrozen at a much smaller LR;
+3. SSP boundaries remain frozen throughout to avoid destroying the mature
+   symmetric frequency partition.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import argparse
 import json
 import math
 import os
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
@@ -41,7 +46,6 @@ from train_stage2_symmetric_frequency import (
 from utils import (
     AverageMeter,
     CSVLogger,
-    count_parameters,
     ensure_dir,
     get_device,
     load_checkpoint,
@@ -103,7 +107,6 @@ def parse_multiscale_args():
     parser.add_argument("--stage2_edge_mask_threshold", type=float, default=0.1)
     parser.add_argument("--stage2_edge_reference_quantile", type=float, default=0.9)
     parser.add_argument("--stage2_noise_quantile", type=float, default=0.2)
-    parser.add_argument("--stage2_boundary_lr_multiplier", type=float, default=10.0)
     parser.add_argument("--stage2_grad_clip", type=float, default=1.0)
 
     parser.add_argument("--stage2_lambda_l1", type=float, default=1.0)
@@ -142,10 +145,16 @@ def parse_multiscale_args():
 
     parser.add_argument("--pyramid_quarter_scale", type=float, default=0.25)
     parser.add_argument("--pyramid_half_scale", type=float, default=0.5)
-    parser.add_argument("--pyramid_lambda_quarter", type=float, default=0.25)
-    parser.add_argument("--pyramid_lambda_half", type=float, default=0.5)
+    parser.add_argument("--pyramid_lambda_quarter", type=float, default=0.1)
+    parser.add_argument("--pyramid_lambda_half", type=float, default=0.25)
+    parser.add_argument("--pyramid_lambda_full", type=float, default=0.5)
     parser.add_argument("--pyramid_lambda_observable", type=float, default=0.1)
     parser.add_argument("--pyramid_lambda_null", type=float, default=0.2)
+
+    parser.add_argument("--pyramid_warmup_epochs", type=int, default=10)
+    parser.add_argument("--pyramid_new_lr", type=float, default=5e-5)
+    parser.add_argument("--pyramid_source_lr", type=float, default=1e-6)
+    parser.add_argument("--pyramid_min_lr_ratio", type=float, default=0.05)
 
     specific, remaining = parser.parse_known_args()
     cfg = parse_args(remaining)
@@ -156,6 +165,13 @@ def parse_multiscale_args():
         cfg.msi_mode = "srf"
     if not _has_option(remaining, "--srf_band_set"):
         cfg.srf_band_set = "wv2_visible6"
+
+    if cfg.pyramid_warmup_epochs < 0:
+        raise ValueError("pyramid_warmup_epochs must be non-negative")
+    if cfg.pyramid_new_lr <= 0 or cfg.pyramid_source_lr < 0:
+        raise ValueError("Pyramid learning rates are invalid")
+    if not 0.0 < cfg.pyramid_min_lr_ratio <= 1.0:
+        raise ValueError("pyramid_min_lr_ratio must lie in (0, 1]")
 
     if cfg.dataset != "PaviaU":
         if cfg.stage1_basis_checkpoint.endswith(
@@ -199,14 +215,18 @@ def load_symmetric_warm_start(
         if key in destination and destination[key].shape == value.shape
     }
     missing, unexpected = model.load_state_dict(transferable, strict=False)
-    allowed_missing = ("quarter_branch.", "half_branch.")
+    allowed_missing = (
+        "quarter_branch.",
+        "half_branch.",
+        "full_correction_branch.",
+    )
     problematic_missing = [
         key for key in missing if not key.startswith(allowed_missing)
     ]
     skipped_source = [key for key in source if key not in transferable]
     if unexpected or problematic_missing or skipped_source:
         raise RuntimeError(
-            "Multiscale warm-start mismatch: "
+            "Residual-pyramid warm-start mismatch: "
             f"unexpected={unexpected}, missing={problematic_missing}, "
             f"skipped_source={skipped_source}"
         )
@@ -214,7 +234,10 @@ def load_symmetric_warm_start(
     return state
 
 
-def project(projector: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+def project(
+    projector: torch.Tensor,
+    coefficients: torch.Tensor,
+) -> torch.Tensor:
     return torch.einsum("rk,nkhw->nrhw", projector, coefficients)
 
 
@@ -224,39 +247,56 @@ def pyramid_losses(
     gt: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
     scale = outputs["coefficient_scale"].view(1, -1, 1, 1)
-    quarter_size = tuple(outputs["pyramid_quarter_normalized_residual"].shape[-2:])
+    quarter_size = tuple(
+        outputs["pyramid_quarter_normalized_residual"].shape[-2:]
+    )
     half_size = tuple(
         outputs["pyramid_half_cumulative_normalized_residual"].shape[-2:]
     )
 
     with torch.no_grad():
         target_coefficients = model.stage1.encode(gt, basis=outputs["basis"])
-        target_full = target_coefficients - outputs["anchor_coefficients"]
-        target_quarter = resize_antialiased(
-            target_full,
+        target_full_residual = (
+            target_coefficients - outputs["anchor_coefficients"]
+        )
+        source_residual = outputs[
+            "pyramid_source_coefficient_residual"
+        ].detach()
+        remaining_full = target_full_residual - source_residual
+        remaining_quarter = resize_antialiased(
+            remaining_full,
             quarter_size,
             mode="bicubic",
         )
-        target_half = resize_antialiased(
-            target_full,
+        remaining_half = resize_antialiased(
+            remaining_full,
             half_size,
             mode="bicubic",
         )
-        target_quarter_observable = project(
-            model.exact_observable_projector.to(target_quarter),
-            target_quarter,
+
+        quarter_observable_target = project(
+            model.exact_observable_projector.to(remaining_quarter),
+            remaining_quarter,
         )
-        target_quarter_null = project(
-            model.exact_null_projector.to(target_quarter),
-            target_quarter,
+        quarter_null_target = project(
+            model.exact_null_projector.to(remaining_quarter),
+            remaining_quarter,
         )
-        target_half_observable = project(
-            model.exact_observable_projector.to(target_half),
-            target_half,
+        half_observable_target = project(
+            model.exact_observable_projector.to(remaining_half),
+            remaining_half,
         )
-        target_half_null = project(
-            model.exact_null_projector.to(target_half),
-            target_half,
+        half_null_target = project(
+            model.exact_null_projector.to(remaining_half),
+            remaining_half,
+        )
+        full_observable_target = project(
+            model.exact_observable_projector.to(remaining_full),
+            remaining_full,
+        )
+        full_null_target = project(
+            model.exact_null_projector.to(remaining_full),
+            remaining_full,
         )
 
     quarter_observable = outputs["pyramid_quarter_observable_residual"]
@@ -272,37 +312,62 @@ def pyramid_losses(
         mode="bicubic",
     ) + outputs["pyramid_half_increment_null_residual"]
 
+    full_observable = outputs["pyramid_correction_observable_residual"]
+    full_null = outputs["pyramid_correction_null_residual"]
+    full_correction = outputs["pyramid_correction_coefficient_residual"]
+
     losses = {
         "pyramid_quarter_total": F.smooth_l1_loss(
             outputs["pyramid_quarter_normalized_residual"],
-            target_quarter / scale,
+            remaining_quarter / scale,
             beta=0.25,
         ),
         "pyramid_half_total": F.smooth_l1_loss(
             outputs["pyramid_half_cumulative_normalized_residual"],
-            target_half / scale,
+            remaining_half / scale,
+            beta=0.25,
+        ),
+        "pyramid_full_total": F.smooth_l1_loss(
+            full_correction / scale,
+            remaining_full / scale,
             beta=0.25,
         ),
         "pyramid_quarter_observable": F.smooth_l1_loss(
             quarter_observable / scale,
-            target_quarter_observable / scale,
+            quarter_observable_target / scale,
             beta=0.25,
         ),
         "pyramid_quarter_null": F.smooth_l1_loss(
             quarter_null / scale,
-            target_quarter_null / scale,
+            quarter_null_target / scale,
             beta=0.25,
         ),
         "pyramid_half_observable": F.smooth_l1_loss(
             half_observable / scale,
-            target_half_observable / scale,
+            half_observable_target / scale,
             beta=0.25,
         ),
         "pyramid_half_null": F.smooth_l1_loss(
             half_null / scale,
-            target_half_null / scale,
+            half_null_target / scale,
             beta=0.25,
         ),
+        "pyramid_full_observable": F.smooth_l1_loss(
+            full_observable / scale,
+            full_observable_target / scale,
+            beta=0.25,
+        ),
+        "pyramid_full_null": F.smooth_l1_loss(
+            full_null / scale,
+            full_null_target / scale,
+            beta=0.25,
+        ),
+        "pyramid_source_residual_abs": outputs[
+            "pyramid_source_normalized_residual"
+        ].abs().mean().detach(),
+        "pyramid_remaining_target_abs": (
+            remaining_full / scale
+        ).abs().mean().detach(),
         "pyramid_quarter_increment_abs": outputs[
             "pyramid_quarter_normalized_residual"
         ].abs().mean().detach(),
@@ -310,7 +375,10 @@ def pyramid_losses(
             "pyramid_half_increment_normalized_residual"
         ].abs().mean().detach(),
         "pyramid_full_increment_abs": outputs[
-            "pyramid_full_increment_normalized_residual"
+            "pyramid_full_correction_normalized_residual"
+        ].abs().mean().detach(),
+        "pyramid_correction_abs": outputs[
+            "pyramid_correction_normalized_residual"
         ].abs().mean().detach(),
     }
     return losses
@@ -319,13 +387,19 @@ def pyramid_losses(
 PYRAMID_NAMES = [
     "pyramid_quarter_total",
     "pyramid_half_total",
+    "pyramid_full_total",
     "pyramid_quarter_observable",
     "pyramid_quarter_null",
     "pyramid_half_observable",
     "pyramid_half_null",
+    "pyramid_full_observable",
+    "pyramid_full_null",
+    "pyramid_source_residual_abs",
+    "pyramid_remaining_target_abs",
     "pyramid_quarter_increment_abs",
     "pyramid_half_increment_abs",
     "pyramid_full_increment_abs",
+    "pyramid_correction_abs",
 ]
 
 
@@ -383,6 +457,12 @@ def train_one_epoch_multiscale(
             * pyramid["pyramid_half_observable"]
             + cfg.pyramid_lambda_null * pyramid["pyramid_half_null"]
         )
+        full_objective = (
+            pyramid["pyramid_full_total"]
+            + cfg.pyramid_lambda_observable
+            * pyramid["pyramid_full_observable"]
+            + cfg.pyramid_lambda_null * pyramid["pyramid_full_null"]
+        )
         total = (
             base["total"]
             + cfg.dual_lambda_observable * dual["dual_observable_loss"]
@@ -391,11 +471,16 @@ def train_one_epoch_multiscale(
             * dual["dual_null_msi_leakage"]
             + cfg.pyramid_lambda_quarter * quarter_objective
             + cfg.pyramid_lambda_half * half_objective
+            + cfg.pyramid_lambda_full * full_objective
         )
         total.backward()
         if cfg.stage2_grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                [
+                    parameter
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ],
                 cfg.stage2_grad_clip,
             )
         optimizer.step()
@@ -407,7 +492,10 @@ def train_one_epoch_multiscale(
             "hsi_l1": float(base["hsi_l1"].detach().item()),
             "sam": float(base["sam"].detach().item()),
             **{name: float(dual[name].detach().item()) for name in DUAL_NAMES},
-            **{name: float(pyramid[name].detach().item()) for name in PYRAMID_NAMES},
+            **{
+                name: float(pyramid[name].detach().item())
+                for name in PYRAMID_NAMES
+            },
             **monitor_values(model, outputs),
         }
         for name, value in values.items():
@@ -450,6 +538,102 @@ def evaluate_multiscale(
     return result
 
 
+def correction_parameters(
+    model: Stage2MultiScalePyramidNet,
+) -> List[torch.nn.Parameter]:
+    parameters: List[torch.nn.Parameter] = []
+    for module in (
+        model.quarter_branch,
+        model.half_branch,
+        model.full_correction_branch,
+    ):
+        parameters.extend(module.parameters())
+    return parameters
+
+
+def split_trainable_parameters(
+    model: Stage2MultiScalePyramidNet,
+) -> tuple[
+    List[torch.nn.Parameter],
+    List[torch.nn.Parameter],
+    List[torch.nn.Parameter],
+]:
+    correction = correction_parameters(model)
+    correction_ids = {id(parameter) for parameter in correction}
+
+    boundaries = list(model.spectral_boundary_parameters())
+    boundary_ids = {id(parameter) for parameter in boundaries}
+    for parameter in boundaries:
+        parameter.requires_grad_(False)
+
+    source = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+        and id(parameter) not in correction_ids
+        and id(parameter) not in boundary_ids
+    ]
+    return correction, source, boundaries
+
+
+def set_requires_grad(
+    parameters: Sequence[torch.nn.Parameter],
+    enabled: bool,
+) -> None:
+    for parameter in parameters:
+        parameter.requires_grad_(enabled)
+
+
+def cosine_lr(
+    base_lr: float,
+    progress: int,
+    total_steps: int,
+    minimum_ratio: float,
+) -> float:
+    if total_steps <= 1:
+        return base_lr
+    ratio = min(max(progress / float(total_steps - 1), 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    return base_lr * (minimum_ratio + (1.0 - minimum_ratio) * cosine)
+
+
+def configure_epoch_training(
+    optimizer: torch.optim.Optimizer,
+    source_parameters: Sequence[torch.nn.Parameter],
+    epoch: int,
+    cfg,
+) -> tuple[float, float, bool]:
+    warmup = min(cfg.pyramid_warmup_epochs, cfg.epochs)
+    source_enabled = epoch >= warmup
+    set_requires_grad(source_parameters, source_enabled)
+
+    if epoch < warmup:
+        correction_lr = cfg.pyramid_new_lr
+        source_lr = 0.0
+    else:
+        post_total = max(cfg.epochs - warmup, 1)
+        post_epoch = epoch - warmup
+        correction_lr = cosine_lr(
+            cfg.pyramid_new_lr,
+            post_epoch,
+            post_total,
+            cfg.pyramid_min_lr_ratio,
+        )
+        source_lr = cosine_lr(
+            cfg.pyramid_source_lr,
+            post_epoch,
+            post_total,
+            cfg.pyramid_min_lr_ratio,
+        )
+
+    for group in optimizer.param_groups:
+        if group.get("group_name") == "correction":
+            group["lr"] = correction_lr
+        elif group.get("group_name") == "source":
+            group["lr"] = source_lr
+    return correction_lr, source_lr, source_enabled
+
+
 @torch.no_grad()
 def export_outputs(
     model: Stage2MultiScalePyramidNet,
@@ -465,21 +649,27 @@ def export_outputs(
         compute_zero_msi=True,
     )
     np.savez_compressed(
-        os.path.join(output_dir, "stage2_multiscale_pyramid_outputs.npz"),
+        os.path.join(output_dir, "stage2_residual_pyramid_outputs.npz"),
         gt=batch["gt"].detach().cpu().numpy(),
         hr_msi=batch["hr_msi"].detach().cpu().numpy(),
         base_hsi=outputs["base_hsi"].detach().cpu().numpy(),
         anchor_hsi=outputs["anchor_hsi"].detach().cpu().numpy(),
         stage2_hsi=outputs["reconstructed_hsi"].detach().cpu().numpy(),
         zero_msi_hsi=outputs["zero_msi_hsi"].detach().cpu().numpy(),
-        quarter_residual=outputs[
+        source_residual=outputs[
+            "pyramid_source_normalized_residual"
+        ].detach().cpu().numpy(),
+        quarter_correction=outputs[
             "pyramid_quarter_normalized_residual"
         ].detach().cpu().numpy(),
-        half_cumulative_residual=outputs[
+        half_cumulative_correction=outputs[
             "pyramid_half_cumulative_normalized_residual"
         ].detach().cpu().numpy(),
-        full_increment_residual=outputs[
-            "pyramid_full_increment_normalized_residual"
+        full_correction=outputs[
+            "pyramid_full_correction_normalized_residual"
+        ].detach().cpu().numpy(),
+        cumulative_correction=outputs[
+            "pyramid_correction_normalized_residual"
         ].detach().cpu().numpy(),
         total_residual=outputs[
             "normalized_coefficient_residual"
@@ -494,7 +684,7 @@ def export_outputs(
 
 def main() -> None:
     cfg = parse_multiscale_args()
-    cfg.stage = "multiscale_coefficient_pyramid"
+    cfg.stage = "multiscale_residual_pyramid"
     set_seed(cfg.seed)
     device = get_device(cfg.device)
     train_loader, test_loader, info = build_loaders(cfg)
@@ -529,62 +719,36 @@ def main() -> None:
         pyramid_half_scale=cfg.pyramid_half_scale,
     ).to(device)
 
-    boundary_lr = cfg.lr * cfg.stage2_boundary_lr_multiplier
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": list(model.regular_parameters()), "lr": cfg.lr},
-            {
-                "params": list(model.spectral_boundary_parameters()),
-                "lr": boundary_lr,
-                "weight_decay": 0.0,
-            },
-        ],
-        weight_decay=cfg.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(cfg.epochs, 1),
-        eta_min=cfg.lr * 0.05,
-    )
-    sam_loss = SAMLoss()
-    hsi_degrader = FixedSpatialDegradation(info["n_bands"]).to(device)
-    coefficient_degrader = FixedSpatialDegradation(stage1.basis_rank).to(device)
-
     checkpoint_dir = os.path.join(
         cfg.checkpoint_root,
-        "stage2_multiscale_pyramid",
+        "stage2_multiscale_residual_pyramid",
         cfg.dataset,
     )
     output_dir = os.path.join(
         cfg.output_root,
-        "stage2_multiscale_pyramid",
+        "stage2_multiscale_residual_pyramid",
         cfg.dataset,
     )
-    log_dir = os.path.join(cfg.log_root, "stage2_multiscale_pyramid")
+    log_dir = os.path.join(
+        cfg.log_root,
+        "stage2_multiscale_residual_pyramid",
+    )
     ensure_dir(checkpoint_dir)
     ensure_dir(output_dir)
     ensure_dir(log_dir)
-    best_path = os.path.join(checkpoint_dir, "multiscale_pyramid_best.pth")
+    best_path = os.path.join(checkpoint_dir, "residual_pyramid_best.pth")
     best_psnr_path = os.path.join(
         checkpoint_dir,
-        "multiscale_pyramid_best_psnr.pth",
+        "residual_pyramid_best_psnr.pth",
     )
     best_sam_path = os.path.join(
         checkpoint_dir,
-        "multiscale_pyramid_best_sam.pth",
+        "residual_pyramid_best_sam.pth",
     )
-    last_path = os.path.join(checkpoint_dir, "multiscale_pyramid_last.pth")
+    last_path = os.path.join(checkpoint_dir, "residual_pyramid_last.pth")
     log_path = os.path.join(log_dir, f"{cfg.dataset}.log")
 
-    start_epoch = 0
-    if cfg.resume:
-        start_epoch, _ = load_checkpoint(
-            model,
-            cfg.resume,
-            optimizer=optimizer,
-            map_location=str(device),
-        )
-    else:
+    if not cfg.resume:
         source_state = load_symmetric_warm_start(
             model,
             cfg.symmetric_frequency_checkpoint,
@@ -594,8 +758,40 @@ def main() -> None:
             log_path,
             f"Loaded symmetric-frequency source "
             f"{cfg.symmetric_frequency_checkpoint} at epoch "
-            f"{source_state.get('epoch', -1)}; pyramid heads initialized to zero.",
+            f"{source_state.get('epoch', -1)}; all correction heads are zero.",
         )
+
+    correction_params, source_params, boundary_params = (
+        split_trainable_parameters(model)
+    )
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": correction_params,
+                "lr": cfg.pyramid_new_lr,
+                "group_name": "correction",
+            },
+            {
+                "params": source_params,
+                "lr": 0.0,
+                "group_name": "source",
+            },
+        ],
+        weight_decay=cfg.weight_decay,
+    )
+
+    start_epoch = 0
+    if cfg.resume:
+        start_epoch, _ = load_checkpoint(
+            model,
+            cfg.resume,
+            optimizer=optimizer,
+            map_location=str(device),
+        )
+
+    sam_loss = SAMLoss()
+    hsi_degrader = FixedSpatialDegradation(info["n_bands"]).to(device)
+    coefficient_degrader = FixedSpatialDegradation(stage1.basis_rank).to(device)
 
     initial = evaluate_multiscale(
         model,
@@ -608,17 +804,21 @@ def main() -> None:
     )
     write_log(
         log_path,
-        f"Multiscale pyramid start | PSNR={initial['stage2_psnr']:.4f}, "
+        f"Residual pyramid start | PSNR={initial['stage2_psnr']:.4f}, "
         f"SAM={initial['stage2_sam']:.4f} deg, "
-        f"increments=({initial['pyramid_quarter_increment_abs']:.5f}, "
-        f"{initial['pyramid_half_increment_abs']:.5f}, "
-        f"{initial['pyramid_full_increment_abs']:.5f}), "
-        f"trainable={count_parameters(model):.3f} M.",
+        f"source={initial['pyramid_source_residual_abs']:.5f}, "
+        f"remaining={initial['pyramid_remaining_target_abs']:.5f}, "
+        f"correction={initial['pyramid_correction_abs']:.5f}, "
+        f"source_params={sum(p.numel() for p in source_params) / 1e6:.3f} M, "
+        f"correction_params={sum(p.numel() for p in correction_params) / 1e6:.3f} M, "
+        f"frozen_boundaries={sum(p.numel() for p in boundary_params)}.",
     )
 
     csv_fields = [
         "epoch",
-        "lr",
+        "correction_lr",
+        "source_lr",
+        "source_enabled",
         "stage2_psnr",
         "stage2_sam",
         "anchor_psnr",
@@ -644,9 +844,10 @@ def main() -> None:
     best_psnr = initial["stage2_psnr"]
     best_sam = initial["stage2_sam"]
     initial_extra = {
-        "stage": "multiscale_coefficient_pyramid",
+        "stage": "multiscale_residual_pyramid",
         "dataset": cfg.dataset,
         "source_checkpoint": cfg.symmetric_frequency_checkpoint,
+        "warmup_epochs": cfg.pyramid_warmup_epochs,
         "validation": initial,
     }
     save_checkpoint(
@@ -675,6 +876,12 @@ def main() -> None:
     )
 
     for epoch in range(start_epoch, cfg.epochs):
+        correction_lr, source_lr, source_enabled = configure_epoch_training(
+            optimizer,
+            source_params,
+            epoch,
+            cfg,
+        )
         train_result = train_one_epoch_multiscale(
             model,
             train_loader,
@@ -694,24 +901,26 @@ def main() -> None:
             cfg,
             device,
         )
-        scheduler.step()
 
         write_log(
             log_path,
             f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | "
+            f"phase={'joint' if source_enabled else 'correction-only'} | "
             f"PSNR={val['stage2_psnr']:.4f}, SAM={val['stage2_sam']:.4f} deg | "
             f"source gain={val['stage2_psnr'] - initial['stage2_psnr']:+.4f} dB | "
+            f"lr=({correction_lr:.2e}, {source_lr:.2e}) | "
+            f"remaining={val['pyramid_remaining_target_abs']:.4f}, "
+            f"correction={val['pyramid_correction_abs']:.4f} | "
             f"increments=({val['pyramid_quarter_increment_abs']:.4f}, "
             f"{val['pyramid_half_increment_abs']:.4f}, "
-            f"{val['pyramid_full_increment_abs']:.4f}) | "
-            f"scale loss=({val['pyramid_quarter_total']:.5f}, "
-            f"{val['pyramid_half_total']:.5f}) | "
-            f"noise={val['noise_ratio']:.4f}.",
+            f"{val['pyramid_full_increment_abs']:.4f}).",
         )
 
         row = {
             "epoch": epoch + 1,
-            "lr": optimizer.param_groups[0]["lr"],
+            "correction_lr": correction_lr,
+            "source_lr": source_lr,
+            "source_enabled": int(source_enabled),
             "stage2_psnr": val["stage2_psnr"],
             "stage2_sam": val["stage2_sam"],
             "anchor_psnr": val["anchor_psnr"],
@@ -733,9 +942,11 @@ def main() -> None:
         csv_logger.write(row)
 
         extra = {
-            "stage": "multiscale_coefficient_pyramid",
+            "stage": "multiscale_residual_pyramid",
             "dataset": cfg.dataset,
             "source_checkpoint": cfg.symmetric_frequency_checkpoint,
+            "warmup_epochs": cfg.pyramid_warmup_epochs,
+            "source_enabled": source_enabled,
             "validation": val,
             "train": train_result,
         }
@@ -803,7 +1014,7 @@ def main() -> None:
         json.dump(final, file, indent=2, ensure_ascii=False)
     write_log(
         log_path,
-        f"Multiscale pyramid complete | PSNR={final['stage2_psnr']:.4f}, "
+        f"Residual pyramid complete | PSNR={final['stage2_psnr']:.4f}, "
         f"SAM={final['stage2_sam']:.4f} deg, "
         f"gain over initial={final['stage2_psnr'] - initial['stage2_psnr']:+.4f} dB.",
     )
