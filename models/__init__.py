@@ -17,6 +17,11 @@ from .stage2_symmetric_frequency import (
     Stage2SymmetricFrequencyNet,
     SymmetricFrequencyReliabilityScreen,
 )
+from .stage3_dual_domain_diffusion import (
+    BasisOrthogonalResidualDiffusionRefiner,
+    ConditionalResidualDenoiser,
+    GaussianDiffusionSchedule,
+)
 
 __all__ = [
     "Stage1SpectralBasisNet",
@@ -26,6 +31,9 @@ __all__ = [
     "Stage2DualSpaceNet",
     "Stage2SymmetricFrequencyNet",
     "Stage2MultiScalePyramidNet",
+    "BasisOrthogonalResidualDiffusionRefiner",
+    "ConditionalResidualDenoiser",
+    "GaussianDiffusionSchedule",
     "SharedMSIFeatureEncoder",
     "ChannelWiseSpectralSplitter",
     "NoiseSplitter",
