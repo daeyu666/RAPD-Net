@@ -567,12 +567,14 @@ class UncertaintyGuidedDualDomainDiffusionRefiner(nn.Module):
         mask: torch.Tensor,
         project_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # Apply the soft mask exactly once. Both clean and noise already carry
+        # the same local support, so their Gaussian mixture remains masked.
         clean = clean * mask
         noise = noise * mask
         if project_fn is not None:
             clean = project_fn(clean)
             noise = project_fn(noise)
-        noisy = self.diffusion.q_sample(clean, timesteps, noise) * mask
+        noisy = self.diffusion.q_sample(clean, timesteps, noise)
         if project_fn is not None:
             noisy = project_fn(noisy)
         return noisy
@@ -692,16 +694,13 @@ class UncertaintyGuidedDualDomainDiffusionRefiner(nn.Module):
                 coefficient_t,
                 predicted_coefficient_noise,
             ).clamp(-self.clean_clip, self.clean_clip)
-            predicted_coefficient_clean = (
-                predicted_coefficient_clean * basis_mask_for_diffusion
-            )
             predicted_orthogonal_clean = self.diffusion.predict_clean_from_noise(
                 noisy_orthogonal,
                 orthogonal_t,
                 predicted_orthogonal_noise,
             ).clamp(-self.clean_clip, self.clean_clip)
             predicted_orthogonal_clean = self.project_orthogonal(
-                predicted_orthogonal_clean * orthogonal_mask_for_diffusion,
+                predicted_orthogonal_clean,
                 basis,
             )
 
@@ -776,8 +775,7 @@ class UncertaintyGuidedDualDomainDiffusionRefiner(nn.Module):
                 sample_shape,
                 device=condition.device,
                 dtype=condition.dtype,
-            )
-        current = current * mask
+            ) * mask
         if project_fn is not None:
             current = project_fn(current)
 
@@ -804,7 +802,6 @@ class UncertaintyGuidedDualDomainDiffusionRefiner(nn.Module):
                 timestep,
                 predicted_noise,
             ).clamp(-self.clean_clip, self.clean_clip)
-            clean = clean * mask
             if project_fn is not None:
                 clean = project_fn(clean)
 
@@ -816,7 +813,7 @@ class UncertaintyGuidedDualDomainDiffusionRefiner(nn.Module):
             current = (
                 torch.sqrt(alpha_next) * clean
                 + torch.sqrt(1.0 - alpha_next) * predicted_noise
-            ) * mask
+            )
             if project_fn is not None:
                 current = project_fn(current)
         return current
