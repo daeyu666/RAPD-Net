@@ -17,6 +17,7 @@ from .stage2_symmetric_frequency import (
     Stage2SymmetricFrequencyNet,
     SymmetricFrequencyReliabilityScreen,
 )
+from .stage3_ablation_mask_curriculum import MaskCurriculumAblationRefiner
 from .stage3_dual_domain_diffusion import (
     BasisOrthogonalResidualDiffusionRefiner,
     ConditionalResidualDenoiser,
@@ -49,6 +50,7 @@ __all__ = [
     "UncertaintyGuidedDualDomainDiffusionRefiner",
     "DeterministicUncertaintyPredictor",
     "LocalConditionalNoiseDenoiser",
+    "MaskCurriculumAblationRefiner",
     "UncertaintyGuidedDualDomainDiffusionRefinerV2",
     "UncertaintyGuidedDualDomainDiffusionRefinerV2Stable",
     "LocalConditionalHybridDenoiser",
