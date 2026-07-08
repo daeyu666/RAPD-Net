@@ -22,6 +22,11 @@ from .stage3_dual_domain_diffusion import (
     ConditionalResidualDenoiser,
     GaussianDiffusionSchedule,
 )
+from .stage3_uncertainty_guided_diffusion import (
+    DeterministicUncertaintyPredictor,
+    LocalConditionalNoiseDenoiser,
+    UncertaintyGuidedDualDomainDiffusionRefiner,
+)
 
 __all__ = [
     "Stage1SpectralBasisNet",
@@ -34,6 +39,9 @@ __all__ = [
     "BasisOrthogonalResidualDiffusionRefiner",
     "ConditionalResidualDenoiser",
     "GaussianDiffusionSchedule",
+    "UncertaintyGuidedDualDomainDiffusionRefiner",
+    "DeterministicUncertaintyPredictor",
+    "LocalConditionalNoiseDenoiser",
     "SharedMSIFeatureEncoder",
     "ChannelWiseSpectralSplitter",
     "NoiseSplitter",
