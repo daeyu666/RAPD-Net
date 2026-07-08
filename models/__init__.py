@@ -31,6 +31,9 @@ from .stage3_uncertainty_guided_diffusion_v2 import (
     LocalConditionalHybridDenoiser,
     UncertaintyGuidedDualDomainDiffusionRefinerV2,
 )
+from .stage3_uncertainty_guided_diffusion_v2_stable import (
+    UncertaintyGuidedDualDomainDiffusionRefinerV2Stable,
+)
 
 __all__ = [
     "Stage1SpectralBasisNet",
@@ -47,6 +50,7 @@ __all__ = [
     "DeterministicUncertaintyPredictor",
     "LocalConditionalNoiseDenoiser",
     "UncertaintyGuidedDualDomainDiffusionRefinerV2",
+    "UncertaintyGuidedDualDomainDiffusionRefinerV2Stable",
     "LocalConditionalHybridDenoiser",
     "SharedMSIFeatureEncoder",
     "ChannelWiseSpectralSplitter",
