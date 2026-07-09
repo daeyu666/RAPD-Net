@@ -18,6 +18,10 @@ from .stage2_symmetric_frequency import (
     SymmetricFrequencyReliabilityScreen,
 )
 from .stage3_ablation_mask_curriculum import MaskCurriculumAblationRefiner
+from .stage3_direct_x0_ablation import (
+    DirectX0ResidualHead,
+    DirectX0Stage3AblationRefiner,
+)
 from .stage3_dual_domain_diffusion import (
     BasisOrthogonalResidualDiffusionRefiner,
     ConditionalResidualDenoiser,
@@ -51,6 +55,8 @@ __all__ = [
     "DeterministicUncertaintyPredictor",
     "LocalConditionalNoiseDenoiser",
     "MaskCurriculumAblationRefiner",
+    "DirectX0ResidualHead",
+    "DirectX0Stage3AblationRefiner",
     "UncertaintyGuidedDualDomainDiffusionRefinerV2",
     "UncertaintyGuidedDualDomainDiffusionRefinerV2Stable",
     "LocalConditionalHybridDenoiser",
