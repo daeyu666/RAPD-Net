@@ -1,13 +1,15 @@
-"""Train Stage 2 symmetric-frequency model with synthetic MSI degradation.
+"""Train Stage 2 symmetric-frequency model with synthetic HR-MSI noise.
 
-This is an ablation script for checking whether the frequency reliability / NSP
-path becomes useful when HR-MSI is no longer an almost perfectly clean
-reference.  The Stage-2 architecture, warm-start checkpoint, optimizer, losses,
-and validation metrics are inherited from ``train_stage2_symmetric_frequency``.
-Only the HR-MSI tensor yielded by the data loader is replaced by a noisy copy.
+Purpose:
+    Test whether the SFSR-style frequency reliability / NSP path becomes useful
+    when HR-MSI is no longer an almost-clean reference.
 
-By default, checkpoints/logs are written to separate *_msi_noise directories, so
-clean Stage-2 experiments are not overwritten.
+Important:
+    The Stage-2 model, warm-start checkpoint, optimizer, losses, and evaluation
+    functions are reused from ``train_stage2_symmetric_frequency.py``.  This
+    script only wraps the data loader and replaces ``batch['hr_msi']`` with a
+    noisy copy.  Outputs are written to separate *_msi_noise directories, so the
+    clean Stage-2 results are not overwritten.
 """
 
 from __future__ import annotations
@@ -17,27 +19,20 @@ import json
 import math
 import os
 import sys
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, Optional
 
-import numpy as np
 import torch
 
 from data_loader import build_loaders
 from losses import SAMLoss
 from models.stage2_symmetric_frequency import Stage2SymmetricFrequencyNet
 from train_stage2_coefficients import (
-    MONITOR_NAMES,
     FixedSpatialDegradation,
     build_spectral_response,
     load_stage1_basis_checkpoint,
 )
-from train_stage2_dual_space import (
-    DUAL_NAMES,
-    evaluate_dual,
-    train_one_epoch_dual,
-)
+from train_stage2_dual_space import train_one_epoch_dual
 from train_stage2_symmetric_frequency import (
-    SYMMETRIC_NAMES,
     _has_option,
     evaluate_symmetric,
     export_outputs,
@@ -50,7 +45,6 @@ from utils import (
     ensure_dir,
     get_device,
     load_checkpoint,
-    move_to_device,
     save_checkpoint,
     set_seed,
     write_log,
@@ -58,45 +52,36 @@ from utils import (
 
 
 class MSINoiseInjector:
-    """Apply synthetic degradation to an HR-MSI tensor.
-
-    The default additive Gaussian setting is intentionally simple: it mainly
-    creates unsupported high-frequency fluctuations, making the reliability map
-    and noise-minimization terms non-trivial without changing Stage-2 itself.
-    """
+    """Synthetic HR-MSI degradation used only by this ablation script."""
 
     def __init__(
         self,
         noise_type: str = "gaussian",
         std: float = 0.03,
-        impulse_prob: float = 0.0,
         speckle_std: float = 0.0,
+        impulse_prob: float = 0.0,
         clip: bool = True,
         clip_min: float = 0.0,
         clip_max: float = 1.0,
     ) -> None:
         self.noise_type = str(noise_type)
         self.std = float(std)
-        self.impulse_prob = float(impulse_prob)
         self.speckle_std = float(speckle_std)
+        self.impulse_prob = float(impulse_prob)
         self.clip = bool(clip)
         self.clip_min = float(clip_min)
         self.clip_max = float(clip_max)
-
-        if self.std < 0:
+        if self.std < 0.0:
             raise ValueError("msi_noise_std must be non-negative")
-        if self.speckle_std < 0:
+        if self.speckle_std < 0.0:
             raise ValueError("msi_noise_speckle_std must be non-negative")
         if not 0.0 <= self.impulse_prob < 1.0:
             raise ValueError("msi_noise_impulse_prob must lie in [0, 1)")
         if self.clip and not self.clip_min < self.clip_max:
-            raise ValueError("msi_noise_clip_min must be smaller than clip_max")
+            raise ValueError("msi_noise_clip_min must be smaller than msi_noise_clip_max")
 
-    def _randn_like(
-        self,
-        x: torch.Tensor,
-        generator: Optional[torch.Generator],
-    ) -> torch.Tensor:
+    @staticmethod
+    def _randn_like(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         return torch.randn(
             x.shape,
             generator=generator,
@@ -104,11 +89,8 @@ class MSINoiseInjector:
             dtype=x.dtype,
         )
 
-    def _rand_like(
-        self,
-        x: torch.Tensor,
-        generator: Optional[torch.Generator],
-    ) -> torch.Tensor:
+    @staticmethod
+    def _rand_like(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         return torch.rand(
             x.shape,
             generator=generator,
@@ -116,15 +98,10 @@ class MSINoiseInjector:
             dtype=x.dtype,
         )
 
-    def __call__(
-        self,
-        clean: torch.Tensor,
-        generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
+    def __call__(self, clean: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         noisy = clean.clone()
-
-        if self.noise_type in {"gaussian", "gaussian_impulse", "gaussian_speckle"}:
-            if self.std > 0:
+        if self.noise_type in {"gaussian", "gaussian_speckle", "gaussian_impulse"}:
+            if self.std > 0.0:
                 noisy = noisy + self.std * self._randn_like(noisy, generator)
         elif self.noise_type == "speckle":
             pass
@@ -132,14 +109,14 @@ class MSINoiseInjector:
             raise ValueError(f"Unsupported msi_noise_type: {self.noise_type}")
 
         if self.noise_type in {"speckle", "gaussian_speckle"}:
-            if self.speckle_std > 0:
+            if self.speckle_std > 0.0:
                 noisy = noisy + clean * self.speckle_std * self._randn_like(
                     noisy,
                     generator,
                 )
 
-        if self.noise_type == "gaussian_impulse" or self.impulse_prob > 0:
-            if self.impulse_prob > 0:
+        if self.noise_type == "gaussian_impulse" or self.impulse_prob > 0.0:
+            if self.impulse_prob > 0.0:
                 mask = self._rand_like(noisy, generator) < self.impulse_prob
                 impulse = self._rand_like(noisy, generator)
                 impulse = impulse * (self.clip_max - self.clip_min) + self.clip_min
@@ -151,47 +128,34 @@ class MSINoiseInjector:
 
 
 class NoisyMSILoader:
-    """A lightweight loader wrapper that replaces ``batch['hr_msi']``."""
+    """Wrap a dataloader and replace ``hr_msi`` by a reproducible noisy copy."""
 
     def __init__(
         self,
         loader: Iterable[Dict[str, torch.Tensor]],
         injector: MSINoiseInjector,
         seed: int,
-        enabled: bool = True,
     ) -> None:
         self.loader = loader
         self.injector = injector
         self.seed = int(seed)
-        self.enabled = bool(enabled)
 
     def __iter__(self):
         generator = torch.Generator()
         generator.manual_seed(self.seed)
         for batch in self.loader:
-            if not self.enabled:
-                yield batch
-                continue
-            if "hr_msi" not in batch:
-                raise KeyError("Batch does not contain 'hr_msi'")
             clean = batch["hr_msi"]
-            noisy = self.injector(clean, generator=generator)
-            noisy_batch = dict(batch)
-            noisy_batch["clean_hr_msi"] = clean
-            noisy_batch["hr_msi"] = noisy
-            yield noisy_batch
+            noisy = self.injector(clean, generator)
+            out = dict(batch)
+            out["clean_hr_msi"] = clean
+            out["hr_msi"] = noisy
+            yield out
 
     def __len__(self) -> int:
         return len(self.loader)  # type: ignore[arg-type]
 
 
-NOISE_STAT_NAMES = [
-    "msi_noise_l1",
-    "msi_noise_rmse",
-    "msi_noise_snr_db",
-    "msi_noise_min",
-    "msi_noise_max",
-]
+NOISE_STAT_NAMES = ["msi_noise_l1", "msi_noise_rmse", "msi_noise_snr_db"]
 
 
 @torch.no_grad()
@@ -202,8 +166,6 @@ def msi_noise_diagnostics(
     meters = {name: AverageMeter() for name in NOISE_STAT_NAMES}
     seen = 0
     for batch in loader:
-        if "clean_hr_msi" not in batch:
-            continue
         clean = batch["clean_hr_msi"].float()
         noisy = batch["hr_msi"].float()
         diff = noisy - clean
@@ -213,20 +175,12 @@ def msi_noise_diagnostics(
             max(float(signal.item()), 1e-12) / max(float(mse.item()), 1e-12)
         )
         batch_size = int(clean.size(0))
-        values = {
-            "msi_noise_l1": float(diff.abs().mean().item()),
-            "msi_noise_rmse": float(torch.sqrt(mse).item()),
-            "msi_noise_snr_db": snr,
-            "msi_noise_min": float(noisy.min().item()),
-            "msi_noise_max": float(noisy.max().item()),
-        }
-        for name, value in values.items():
-            meters[name].update(value, batch_size)
+        meters["msi_noise_l1"].update(float(diff.abs().mean().item()), batch_size)
+        meters["msi_noise_rmse"].update(float(torch.sqrt(mse).item()), batch_size)
+        meters["msi_noise_snr_db"].update(snr, batch_size)
         seen += 1
         if max_batches > 0 and seen >= max_batches:
             break
-    if seen == 0:
-        return {name: 0.0 for name in NOISE_STAT_NAMES}
     return {name: meter.avg for name, meter in meters.items()}
 
 
@@ -250,21 +204,14 @@ def parse_msi_noise_args():
         type=str,
         default="both",
         choices=["clean", "noisy", "both"],
-        help="Evaluate clean MSI, noisy MSI, or both after every epoch.",
     )
     parser.add_argument(
         "--msi_noise_selection_eval",
         type=str,
         default="noisy",
         choices=["clean", "noisy"],
-        help="Validation split used for best checkpoint selection.",
     )
-    parser.add_argument(
-        "--msi_noise_stats_batches",
-        type=int,
-        default=10,
-        help="Number of batches used to estimate noise diagnostics.",
-    )
+    parser.add_argument("--msi_noise_stats_batches", type=int, default=10)
 
     noise_args, remaining = parser.parse_known_args()
     original_argv = sys.argv
@@ -283,7 +230,6 @@ def parse_msi_noise_args():
         cfg.log_root = "./logs_msi_noise"
     if not _has_option(remaining, "--output_root"):
         cfg.output_root = "./outputs_msi_noise"
-
     if cfg.msi_noise_eval_mode == "clean" and cfg.msi_noise_selection_eval == "noisy":
         raise ValueError("Cannot select noisy validation when msi_noise_eval_mode=clean")
     return cfg
@@ -293,67 +239,20 @@ def make_injector(cfg) -> MSINoiseInjector:
     return MSINoiseInjector(
         noise_type=cfg.msi_noise_type,
         std=cfg.msi_noise_std,
-        impulse_prob=cfg.msi_noise_impulse_prob,
         speckle_std=cfg.msi_noise_speckle_std,
+        impulse_prob=cfg.msi_noise_impulse_prob,
         clip=cfg.msi_noise_clip,
         clip_min=cfg.msi_noise_clip_min,
         clip_max=cfg.msi_noise_clip_max,
     )
 
 
-def make_noisy_loader(loader, injector: MSINoiseInjector, seed: int) -> NoisyMSILoader:
-    return NoisyMSILoader(loader, injector=injector, seed=seed, enabled=True)
-
-
-VALIDATION_SUMMARY_NAMES = [
-    "stage2_psnr",
-    "stage2_sam",
-    "anchor_psnr",
-    "anchor_sam",
-    "zero_msi_psnr_drop",
-    "stage2_psnr_gain_over_anchor",
-    "noise_ratio",
-    "reliability_ratio",
-    "symmetric_low_share",
-    "symmetric_mid_share",
-    "symmetric_high_share",
-    "symmetric_reliable_high_abs",
-]
-
-
-def add_prefixed_summary(
-    row: Dict[str, float],
-    prefix: str,
-    values: Optional[Dict[str, float]],
-) -> None:
-    if values is None:
-        return
-    for name in VALIDATION_SUMMARY_NAMES:
-        if name in values:
-            row[f"{prefix}_{name}"] = values[name]
-
-
-def selected_metric_names() -> List[str]:
-    return [
-        "stage2_psnr",
-        "stage2_sam",
-        "anchor_psnr",
-        "anchor_sam",
-        "oracle_psnr",
-        "oracle_sam",
-        "psnr_gain_over_base",
-        "stage2_psnr_gain_over_anchor",
-        "zero_msi_psnr_drop",
-        "remaining_psnr_to_oracle",
-        "recoverable_error_fraction",
-        *DUAL_NAMES,
-        *SYMMETRIC_NAMES,
-        *MONITOR_NAMES,
-    ]
+def noisy_loader(loader, injector: MSINoiseInjector, seed: int) -> NoisyMSILoader:
+    return NoisyMSILoader(loader, injector, seed)
 
 
 @torch.no_grad()
-def run_validation(
+def evaluate_clean_and_noisy(
     model: Stage2SymmetricFrequencyNet,
     clean_loader,
     injector: MSINoiseInjector,
@@ -376,32 +275,40 @@ def run_validation(
             device,
         )
     if cfg.msi_noise_eval_mode in {"noisy", "both"}:
-        noisy_loader = make_noisy_loader(clean_loader, injector, seed=seed)
+        n_loader = noisy_loader(clean_loader, injector, seed)
         results["noisy"] = evaluate_symmetric(
             model,
-            noisy_loader,
+            n_loader,
             hsi_degrader,
             coefficient_degrader,
             sam_loss,
             cfg,
             device,
         )
-        stats_loader = make_noisy_loader(clean_loader, injector, seed=seed)
         results["noisy"].update(
             msi_noise_diagnostics(
-                stats_loader,
+                noisy_loader(clean_loader, injector, seed),
                 max_batches=cfg.msi_noise_stats_batches,
             )
         )
     return results
 
 
-def validation_for_selection(results: Dict[str, Dict[str, float]], cfg) -> Dict[str, float]:
+def select_validation(results: Dict[str, Dict[str, float]], cfg) -> Dict[str, float]:
     if cfg.msi_noise_selection_eval in results:
         return results[cfg.msi_noise_selection_eval]
     if "clean" in results:
         return results["clean"]
     return results["noisy"]
+
+
+def summary_text(name: str, value: Optional[Dict[str, float]]) -> str:
+    if value is None:
+        return f"{name}=N/A"
+    return (
+        f"{name}={value['stage2_psnr']:.4f}/{value['stage2_sam']:.4f}, "
+        f"rel={value['reliability_ratio']:.4f}, noise={value['noise_ratio']:.4f}"
+    )
 
 
 def main() -> None:
@@ -521,7 +428,7 @@ def main() -> None:
         "eval_mode": cfg.msi_noise_eval_mode,
         "selection_eval": cfg.msi_noise_selection_eval,
     }
-    initial_results = run_validation(
+    initial_results = evaluate_clean_and_noisy(
         model,
         test_loader,
         injector,
@@ -532,19 +439,14 @@ def main() -> None:
         device,
         seed=cfg.seed + 100_000,
     )
-    initial = validation_for_selection(initial_results, cfg)
-    clean_initial = initial_results.get("clean")
-    noisy_initial = initial_results.get("noisy")
+    initial = select_validation(initial_results, cfg)
     write_log(
         log_path,
         "Symmetric SSP MSI-noise start | "
-        f"selection={cfg.msi_noise_selection_eval}, "
-        f"noise={noise_cfg}, "
-        f"selected PSNR={initial['stage2_psnr']:.4f}, "
-        f"SAM={initial['stage2_sam']:.4f} deg, "
-        f"clean PSNR={(clean_initial or initial)['stage2_psnr']:.4f}, "
-        f"noisy PSNR={(noisy_initial or initial)['stage2_psnr']:.4f}, "
-        f"noisy reliability={(noisy_initial or initial)['reliability_ratio']:.4f}, "
+        f"noise={noise_cfg}, selection={cfg.msi_noise_selection_eval}, "
+        f"selected={initial['stage2_psnr']:.4f}/{initial['stage2_sam']:.4f}, "
+        f"{summary_text('clean', initial_results.get('clean'))}, "
+        f"{summary_text('noisy', initial_results.get('noisy'))}, "
         f"trainable={count_parameters(model):.3f} M.",
     )
 
@@ -552,15 +454,21 @@ def main() -> None:
         "epoch",
         "lr",
         "selection_eval",
-        "msi_noise_type",
-        "msi_noise_std",
-        "msi_noise_speckle_std",
-        "msi_noise_impulse_prob",
+        "clean_psnr",
+        "clean_sam",
+        "clean_reliability_ratio",
+        "clean_noise_ratio",
+        "noisy_psnr",
+        "noisy_sam",
+        "noisy_reliability_ratio",
+        "noisy_noise_ratio",
+        "noisy_high_share",
         *NOISE_STAT_NAMES,
-        *selected_metric_names(),
+        "selected_psnr",
+        "selected_sam",
+        "selected_zero_msi_psnr_drop",
+        "selected_stage2_psnr_gain_over_anchor",
     ]
-    for prefix in ("clean", "noisy"):
-        csv_fields.extend(f"{prefix}_{name}" for name in VALIDATION_SUMMARY_NAMES)
     csv_logger = CSVLogger(os.path.join(log_dir, f"{cfg.dataset}.csv"), csv_fields)
 
     best_selection = initial["selection"]
@@ -573,40 +481,14 @@ def main() -> None:
         "noise": noise_cfg,
         "validation": initial_results,
     }
-    save_checkpoint(
-        model,
-        optimizer,
-        start_epoch,
-        best_selection,
-        best_path,
-        extra=initial_extra,
-    )
-    save_checkpoint(
-        model,
-        optimizer,
-        start_epoch,
-        best_psnr,
-        best_psnr_path,
-        extra=initial_extra,
-    )
-    save_checkpoint(
-        model,
-        optimizer,
-        start_epoch,
-        best_sam,
-        best_sam_path,
-        extra=initial_extra,
-    )
+    save_checkpoint(model, optimizer, start_epoch, best_selection, best_path, extra=initial_extra)
+    save_checkpoint(model, optimizer, start_epoch, best_psnr, best_psnr_path, extra=initial_extra)
+    save_checkpoint(model, optimizer, start_epoch, best_sam, best_sam_path, extra=initial_extra)
 
     for epoch in range(start_epoch, cfg.epochs):
-        noisy_train_loader = make_noisy_loader(
-            train_loader,
-            injector,
-            seed=cfg.seed + epoch,
-        )
         train_one_epoch_dual(
             model,
-            noisy_train_loader,
+            noisy_loader(train_loader, injector, seed=cfg.seed + epoch),
             optimizer,
             hsi_degrader,
             coefficient_degrader,
@@ -614,7 +496,7 @@ def main() -> None:
             cfg,
             device,
         )
-        val_results = run_validation(
+        val_results = evaluate_clean_and_noisy(
             model,
             test_loader,
             injector,
@@ -625,7 +507,7 @@ def main() -> None:
             device,
             seed=cfg.seed + 100_000 + epoch,
         )
-        val = validation_for_selection(val_results, cfg)
+        val = select_validation(val_results, cfg)
         scheduler.step()
 
         clean_val = val_results.get("clean")
@@ -633,33 +515,44 @@ def main() -> None:
         write_log(
             log_path,
             f"Epoch {epoch + 1:03d}/{cfg.epochs:03d} | "
-            f"selected={cfg.msi_noise_selection_eval} | "
-            f"PSNR={val['stage2_psnr']:.4f}, SAM={val['stage2_sam']:.4f} deg | "
-            f"clean={clean_val['stage2_psnr']:.4f}/{clean_val['stage2_sam']:.4f} "
-            if clean_val is not None
-            else ""
-            + f"noisy={noisy_val['stage2_psnr']:.4f}/{noisy_val['stage2_sam']:.4f} "
-            if noisy_val is not None
-            else ""
-            + f"| reliability={val['reliability_ratio']:.4f}, "
-            f"noise_ratio={val['noise_ratio']:.4f}, "
-            f"high_share={val['symmetric_high_share']:.3f}.",
+            f"selected={cfg.msi_noise_selection_eval} "
+            f"{val['stage2_psnr']:.4f}/{val['stage2_sam']:.4f} | "
+            f"{summary_text('clean', clean_val)} | "
+            f"{summary_text('noisy', noisy_val)} | "
+            f"high_share={val.get('symmetric_high_share', 0.0):.3f}.",
         )
 
         row = {
             "epoch": epoch + 1,
             "lr": optimizer.param_groups[0]["lr"],
             "selection_eval": cfg.msi_noise_selection_eval,
-            "msi_noise_type": cfg.msi_noise_type,
-            "msi_noise_std": cfg.msi_noise_std,
-            "msi_noise_speckle_std": cfg.msi_noise_speckle_std,
-            "msi_noise_impulse_prob": cfg.msi_noise_impulse_prob,
+            "selected_psnr": val["stage2_psnr"],
+            "selected_sam": val["stage2_sam"],
+            "selected_zero_msi_psnr_drop": val["zero_msi_psnr_drop"],
+            "selected_stage2_psnr_gain_over_anchor": val[
+                "stage2_psnr_gain_over_anchor"
+            ],
         }
-        row.update({name: val.get(name, "") for name in selected_metric_names()})
+        if clean_val is not None:
+            row.update(
+                {
+                    "clean_psnr": clean_val["stage2_psnr"],
+                    "clean_sam": clean_val["stage2_sam"],
+                    "clean_reliability_ratio": clean_val["reliability_ratio"],
+                    "clean_noise_ratio": clean_val["noise_ratio"],
+                }
+            )
         if noisy_val is not None:
-            row.update({name: noisy_val.get(name, "") for name in NOISE_STAT_NAMES})
-        add_prefixed_summary(row, "clean", clean_val)
-        add_prefixed_summary(row, "noisy", noisy_val)
+            row.update(
+                {
+                    "noisy_psnr": noisy_val["stage2_psnr"],
+                    "noisy_sam": noisy_val["stage2_sam"],
+                    "noisy_reliability_ratio": noisy_val["reliability_ratio"],
+                    "noisy_noise_ratio": noisy_val["noise_ratio"],
+                    "noisy_high_share": noisy_val["symmetric_high_share"],
+                    **{name: noisy_val[name] for name in NOISE_STAT_NAMES},
+                }
+            )
         csv_logger.write(row)
 
         extra = {
@@ -672,42 +565,14 @@ def main() -> None:
         }
         if val["selection"] < best_selection:
             best_selection = val["selection"]
-            save_checkpoint(
-                model,
-                optimizer,
-                epoch + 1,
-                best_selection,
-                best_path,
-                extra=extra,
-            )
+            save_checkpoint(model, optimizer, epoch + 1, best_selection, best_path, extra=extra)
         if val["stage2_psnr"] > best_psnr:
             best_psnr = val["stage2_psnr"]
-            save_checkpoint(
-                model,
-                optimizer,
-                epoch + 1,
-                best_psnr,
-                best_psnr_path,
-                extra=extra,
-            )
+            save_checkpoint(model, optimizer, epoch + 1, best_psnr, best_psnr_path, extra=extra)
         if val["stage2_sam"] < best_sam:
             best_sam = val["stage2_sam"]
-            save_checkpoint(
-                model,
-                optimizer,
-                epoch + 1,
-                best_sam,
-                best_sam_path,
-                extra=extra,
-            )
-        save_checkpoint(
-            model,
-            optimizer,
-            epoch + 1,
-            best_selection,
-            last_path,
-            extra=extra,
-        )
+            save_checkpoint(model, optimizer, epoch + 1, best_sam, best_sam_path, extra=extra)
+        save_checkpoint(model, optimizer, epoch + 1, best_selection, last_path, extra=extra)
 
     load_checkpoint(
         model,
@@ -716,7 +581,7 @@ def main() -> None:
         map_location=str(device),
         load_optimizer=False,
     )
-    final_results = run_validation(
+    final_results = evaluate_clean_and_noisy(
         model,
         test_loader,
         injector,
@@ -727,21 +592,16 @@ def main() -> None:
         device,
         seed=cfg.seed + 200_000,
     )
-    final = validation_for_selection(final_results, cfg)
-
+    final = select_validation(final_results, cfg)
     export_outputs(model, test_loader, os.path.join(output_dir, "clean"), device)
     if cfg.msi_noise_eval_mode in {"noisy", "both"}:
         export_outputs(
             model,
-            make_noisy_loader(test_loader, injector, seed=cfg.seed + 200_000),
+            noisy_loader(test_loader, injector, seed=cfg.seed + 200_000),
             os.path.join(output_dir, "noisy"),
             device,
         )
-    with open(
-        os.path.join(output_dir, "final_metrics.json"),
-        "w",
-        encoding="utf-8",
-    ) as file:
+    with open(os.path.join(output_dir, "final_metrics.json"), "w", encoding="utf-8") as file:
         json.dump(final_results, file, indent=2, ensure_ascii=False)
     write_log(
         log_path,
