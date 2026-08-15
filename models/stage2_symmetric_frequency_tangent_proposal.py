@@ -72,14 +72,14 @@ class SymmetricFrequencyDifferenceGuidance(nn.Module):
             hard_partition=hard_partition,
         )
 
-        # Use one shared adapter for L/M/H so only the frequency content changes;
-        # the three output blocks have exactly the same channel count as the
-        # [HR-MSI, base-MSI, MSI-residual] blocks they replace.
+        # Shared across L/M/H and bias-free: zero cross-source difference must
+        # remain zero guidance. The three blocks keep the same channel count as
+        # the raw MSI blocks they replace in the controlled experiment.
         self.band_adapter = nn.Conv2d(
             self.feature_channels,
             self.msi_channels,
             kernel_size=1,
-            bias=True,
+            bias=False,
         )
 
     @staticmethod
@@ -202,7 +202,6 @@ class Stage2SymmetricFrequencyTangentProposalNet(Stage2TangentProjectedProposalN
         )
 
     def regular_trainable_parameters(self):
-        # Proposal predictor plus non-boundary frequency parameters.
         yield from self.proposal_predictor.parameters()
         yield from self.frequency_guidance.regular_parameters()
 
